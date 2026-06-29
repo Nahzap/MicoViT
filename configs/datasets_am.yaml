@@ -1,0 +1,22 @@
+# Subsets AM únicamente — micorrizas arbusculares (Evangelisti / AMFinder).
+data_root: "Data"
+
+subsets:
+  - name: am_train
+    lineage: AM
+    split: train
+    glob: "am/am/train/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: am_test
+    lineage: AM
+    split: test
+    glob: "am/am/test/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+tile:
+  pixel_size: 252
+  vit_input_size: 518
+  stride: 252

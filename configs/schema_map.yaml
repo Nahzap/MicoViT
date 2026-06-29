@@ -1,0 +1,105 @@
+# schema_map.yaml
+# Mapeo de etiquetas brutas (CSV one-hot por tile) a la jerarquía del sistema:
+#   - Stage1 (gate)   : M+ / M- / Background / Unreadable
+#   - Stage2 (subclases) : disponible sólo si Stage1 == M+
+#
+# Cada linaje (`AM`, `ERM`) puede tener su propia tabla de columnas.
+# Las columnas no listadas explícitamente se ignoran con un warning durante la ingesta.
+
+schema_version: 1
+
+# --- Etiquetas canónicas del sistema ---
+stage1_classes: [Mplus, Mminus, Background, Unreadable]
+
+# Conjunto de subclases por linaje (se usa en Fase E).
+stage2_classes:
+  AM:   [AMColonised, DSE, Hybrid]
+  ERM:  [BlueCoils, BrownCoils, TypeTwo, HybridErm, HybridDse]
+
+# --- Inferencia automática del linaje a partir del path o del header del CSV ---
+lineage_detectors:
+  - name: AM
+    # cualquiera de estas pistas activa el linaje AM
+    path_substrings: ["\\am\\", "/am/"]
+    header_must_include: ["AMColonised"]
+  - name: ERM
+    path_substrings: ["erm_", "/erm/", "\\erm_"]
+    header_must_include: ["BlueCoils"]
+
+# --- Tabla de mapeo: columna_CSV -> { stage1, stage2 } ---
+# stage1: clase canónica del gate.
+# stage2: subclase (sólo si stage1 == Mplus). null si la columna no aporta a Stage2.
+columns:
+
+  # ----- compartidas -----
+  Background:
+    stage1: Background
+    stage2: null
+  Unreadable:
+    stage1: Unreadable
+    stage2: null
+  Question:
+    stage1: Unreadable
+    stage2: null
+  Uncolonised:
+    stage1: Mminus
+    stage2: null
+  MainRoot:
+    stage1: Mminus
+    stage2: null
+
+  # ----- AM (línea arbuscular) -----
+  AMColonised:
+    stage1: Mplus
+    stage2: AMColonised
+    lineage: AM
+  Hybrid:
+    stage1: Mplus
+    stage2: Hybrid
+    lineage: AM
+  DSE:
+    # DSE no es AMF; en Stage1 se trata como M- (no colonización por AMF).
+    # Se conserva como columna auxiliar para análisis morfológico (Capa L9).
+    stage1: Mminus
+    stage2: null
+    aux_class: DSE
+
+  # ----- ERM (línea ericoide) -----
+  BlueCoils:
+    stage1: Mplus
+    stage2: BlueCoils
+    lineage: ERM
+  BrownCoils:
+    stage1: Mplus
+    stage2: BrownCoils
+    lineage: ERM
+  TypeTwo:
+    stage1: Mplus
+    stage2: TypeTwo
+    lineage: ERM
+  HybridErm:
+    stage1: Mplus
+    stage2: HybridErm
+    lineage: ERM
+  HybridDse:
+    stage1: Mplus
+    stage2: HybridDse
+    lineage: ERM
+
+# --- Política de conflicto (más de un 1 en la misma fila) ---
+# 'priority': se queda con la primera clase positiva según este orden.
+conflict_policy: priority
+priority_order:
+  - Background
+  - Unreadable
+  - Question
+  - AMColonised
+  - BlueCoils
+  - BrownCoils
+  - TypeTwo
+  - Hybrid
+  - HybridErm
+  - HybridDse
+  - DSE
+  - MainRoot
+  - Uncolonised

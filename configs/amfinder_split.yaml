@@ -1,0 +1,13 @@
+# Split fijo AMFinder CNN1 para reentrenamiento gate AM v4.
+# train: adaptacion dominio (Keyence 256 px)
+# external: holdout bloqueado — nunca entra en cache train ni checkpoint.
+
+train_stems:
+  - CNN1_Keyence_Nbenth_myc_1
+  - CNN1_Keyence_Nbenth_myc_2
+  - CNN1_Keyence_Nbenth_myc_3
+
+catalog: "Data/am/am/amfinder_eval/amfinder_eval_catalog.json"
+source_dir: "Data/am/am/amfinder_eval"
+train_dir: "Data/am/am/amfinder_train"
+external_dir: "Data/am/am/amfinder_external"

@@ -1,0 +1,69 @@
+# datasets.yaml
+# Declaración explícita de los subsets ingestables. La Fase A escanea estas rutas,
+# detecta pares (imagen, csv) por nombre base y genera los manifests.
+
+data_root: "Data"
+
+subsets:
+
+  - name: am_train
+    lineage: AM
+    split: train
+    glob: "am/am/train/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    # El CSV adjunto suele tener el patrón:
+    #   <stem>_YYYY-MM-DDTHH_MM_SS.SSSSSS_cnn_1_annotations.csv
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: am_test
+    lineage: AM
+    split: test
+    glob: "am/am/test/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: erm_train_1
+    lineage: ERM
+    split: train
+    glob: "erm_train_1/train_1/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: erm_test
+    lineage: ERM
+    split: test
+    glob: "erm_test/test/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: amfinder_train
+    lineage: AM
+    split: train
+    glob: "am/am/amfinder_train/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+  - name: amfinder_external
+    lineage: AM
+    split: external_test
+    glob: "am/am/amfinder_external/*.jpg"
+    annotations_suffix: "_cnn_1_annotations.csv"
+    annotations_pattern: "{stem}_*_cnn_1_annotations.csv"
+
+# --- Parámetros geométricos (verificados con Fase A + B) ---
+# Verificación AM (anotaciones densas, conteo de tiles == grid completo):
+#   10E_2L_E_Default (15324x6030 px)  -> 1380 tiles  => 60x23 con t=252
+#   1D-1L-8_Default  (11264x11776 px) -> 2024 tiles  => 44x46 con t=252
+#   20C-2L-7_Default (13056x10496 px) -> 2091 tiles  => 51x41 con t=252
+# Verificación ERM (anotaciones sparse, max(col) acota tile_size):
+#   NO1_02_Tet_01    (38893x19505 px) -> max col=275 obliga t<=141 -> t=126
+# Conclusión: tile_size depende del linaje (estructuras ERM más finas).
+tile:
+  pixel_size_by_lineage:
+    AM: 252
+    ERM: 126
+  default: 252             # fallback si no se conoce el linaje
+  vit_input_size: 518      # tamaño objetivo para DINOv2 ViT (Fase B)
+  stride_by_lineage:
+    AM: 252
+    ERM: 126

@@ -1,0 +1,82 @@
+# Entorno virtual del proyecto
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Datos pesados (los CSV pequeños sí se versionan; las imágenes no)
+Data/**/*.jpg
+Data/**/*.jpeg
+Data/**/*.png
+Data/**/*.tif
+Data/**/*.tiff
+
+# Salidas
+manifests/
+outputs/
+runs/
+checkpoints/
+*.parquet
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Documentación
+Docs/
+*.md
+
+# Data
+Data/
+Data/**/
+
+# Zips
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.lzma
+*.tar.lz
+*.tar.lz4
+*.tar.zstd
+*.tar.z
+
+# Big Data
+*.h5
+*.npy
+*.npz
+*.npz.gz
+*.npz.gz.part
+*.npz.gz.part.1
+*.npz.gz.part.2
+*.npz.gz.part.3
+*.npz.gz.part.4
+*.npz.gz.part.5
+
+# Cache
+cache/
+cache/**/
+
+# Locks
+locks/
+locks/**/
+
+# logs
+*.log/**/

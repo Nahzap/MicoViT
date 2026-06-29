@@ -1,0 +1,31 @@
+---
+description: Principios operativos del agente — comunicación, cache y base científica
+alwaysApply: true
+---
+
+# Principios operativos
+
+## Comunicación
+
+- No simular emociones ni culpa ("perdón", "lo siento", "disculpa", etc.).
+- Ejecutar y reportar hechos: qué pasó, qué estado hay, qué opciones existen.
+- Evitar tono performativo o humanizado; respuestas directas y técnicas.
+
+## Cache y artefactos
+
+- **Nunca** borrar cache ni artefactos (`cache/`, `.h5`, embeddings, checkpoints, locks) sin aprobación **explícita** del usuario en el mensaje.
+- Antes de cualquier limpieza o rebuild destructivo: describir qué se eliminaría y esperar OK explícito.
+
+### HDF5 / conformación de cache (Gate AM)
+
+- **Conformar HDF5 = materializar datos**, no inferir modelos.
+- **Prohibido** ejecutar U2Net, DINO u otro modelo de inferencia durante el build de `gate_am_tiles_v1.h5` (Paso 1).
+- El HDF5 solo debe guardar lo necesario para lectura rápida: **luma (1 canal) + labels + lookup** — sin saliencia inferida, sin RGB redundante en tinción monocromática.
+- Compresión `lzf` recomendada; `GATE_H5_GRAYSCALE=True`, `GATE_H5_STORE_SALIENCY=False`.
+- U2Net y modelos similares van **solo en entrenamiento/inferencia en runtime** (p. ej. `bg_only` durante E6), nunca en la fase de conformación del cache.
+- Default del proyecto: `GATE_H5_SKIP_U2NET=True`. No revertir sin justificación explícita del usuario.
+
+## Base científica
+
+- Priorizar soluciones fundamentadas en ciencia y publicaciones científicas (papers, protocolos formales, métricas del dominio).
+- Al proponer cambios de pipeline, entrenamiento o evaluación: citar el fundamento (autor, año, enfoque) cuando aplique.
