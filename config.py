@@ -41,7 +41,7 @@ AUTO_REBUILD_CACHE: bool = True
 GATE_H5_CACHE_ENABLED: bool = True
 GATE_EMBED_BUILD_FROM_H5: bool = True  # compilar embeddings leyendo HDF5 (sin JPEG)
 # Paso 1 HDF5 — materialización ligera (sin inferencia)
-GATE_H5_BATCH_SIZE: int = 128  # sin U2Net en build; mas tiles/batch en RTX 3070 8GB
+GATE_H5_BATCH_SIZE: int = 256  # sin U2Net en build; mas tiles/batch en RTX 3070 8GB
 GATE_H5_CHUNK_TILES: int = 64  # chunks HDF5
 GATE_H5_COMPRESSION: str = "none"  # max velocidad escritura SSD (lzf ralentiza CPU+disco)
 GATE_H5_GRAYSCALE: bool = True  # 1 canal luma (tinción monocromática); ~3x vs RGB
@@ -230,3 +230,110 @@ DEFAULT_IMAGE: Path | None = (
 DEFAULT_TAU_S1: float = 0.65
 DEFAULT_BATCH_SIZE: int = 32
 DEFAULT_LINEAGE: str = "AM"
+
+# ---------------------------------------------------------------------------
+# ViT-S2 — Stage2 discriminador subclases en tiles M+ (plan 20260628_225244)
+# ---------------------------------------------------------------------------
+
+STAGE2_GATE_RUN_ID: str = "20260624_012932_gate_am_train"
+STAGE2_LINEAGE_DEFAULT: str = "AM"
+STAGE2_BACKBONE: str = "dinov2_vits14"
+STAGE2_DINO_INPUT_SIZE: int = 224
+STAGE2_HEAD_HIDDEN: int = 256
+STAGE2_DROPOUT: float = 0.2
+STAGE2_EPOCHS: int = 30
+STAGE2_BATCH_SIZE: int = 16
+STAGE2_LR: float = 1e-4
+STAGE2_BACKBONE_LR_FACTOR: float = 0.1
+STAGE2_VAL_FRACTION: float = 0.2
+STAGE2_FREEZE_BACKBONE: bool = False
+STAGE2_LOSS: str = "focal"  # ce | focal
+STAGE2_FOCAL_GAMMA: float = 2.0
+STAGE2_HYBRID_OVERSAMPLE: int = 8
+STAGE2_TRAIN_SUBSETS: str = "am_train"
+STAGE2_BRANCHES: str = "A"
+STAGE2_CHECKPOINT_METRIC: str = "f1_macro"
+STAGE2_TAU_GATE_MPLUS: float = 0.65
+STAGE2_USE_AMP: bool = True
+STAGE2_SKIP_B: bool = True
+STAGE2_SKIP_C: bool = True
+
+# ---------------------------------------------------------------------------
+# Fase 2 píxel — morfología IH/A/V/H (plan 20260629_134156)
+# ---------------------------------------------------------------------------
+
+STAGE2_PIXEL_ENABLED: bool = True
+STAGE2_PIXEL_BACKEND: str = "vit"  # weak | vit | ensemble
+STAGE2_PIXEL_VIT_MODEL: str = "dinov2_vits14"
+STAGE2_PIXEL_INPUT_SIZE: int = 224
+STAGE2_PIXEL_FREEZE_BACKBONE: bool = True  # 8 GB VRAM: solo decoder, sin memoria compartida
+STAGE2_PIXEL_EPOCHS: int = 20
+STAGE2_PIXEL_BATCH_SIZE: int = 128  # óptimo ~tiles/s; 256↑VRAM pero I/O HDF5 limita (~16 batches/ep)
+STAGE2_PIXEL_GRAD_ACCUM_STEPS: int = 1
+STAGE2_PIXEL_LR: float = 1e-4
+STAGE2_PIXEL_BACKBONE_LR_FACTOR: float = 0.1
+STAGE2_PIXEL_VAL_FRACTION: float = 0.2
+STAGE2_PIXEL_USE_AMP: bool = True
+STAGE2_PIXEL_GATE_RUN_ID: str = "20260624_012932_gate_am_train"
+STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN: float = 0.85
+STAGE2_PIXEL_FRANGI_PCTL: float = 82.0
+STAGE2_PIXEL_ARBUSCULE_PCTL: float = 93.0
+STAGE2_PIXEL_H5_ENABLED: bool = True
+STAGE2_PIXEL_H5_COMPRESSION: str = "lzf"  # lzf | none
+STAGE2_PIXEL_H5_FORCE_REBUILD: bool = False   # one-shot completado 2026-07-08
+STAGE2_PIXEL_H5_PROFILE_ON_TRAIN: bool = False  # skip ~15s scan en cada arranque si cache hit
+STAGE2_PIXEL_H5_STORE_PRIORS: bool = True  # materializa Frangi/entropía en HDF5 (one-shot, train solo GPU)
+STAGE2_PIXEL_H5_BATCH_PREFETCH: bool = True  # precarga siguiente batch HDF5 mientras GPU entrena
+STAGE2_PIXEL_H5_RAM_CACHE: bool = True  # ~4GB RAM: carga H5 una vez, evita lzf/batch (~3-5x tiles/s)
+STAGE2_PIXEL_H5_BUILD_BATCH: int = 8
+STAGE2_PIXEL_H5_BUILD_WORKERS: int = 0  # 0 = auto (min(12, cpu_count-2)); rgb+label+priors en paralelo
+# Flip oversample tiles con vesículas (train only)
+STAGE2_PIXEL_FLIP_OVERSAMPLE_V: bool = True
+STAGE2_PIXEL_V_MIN_PX: int = 30
+STAGE2_PIXEL_RARE_FLIP_VARIANTS: int = 4
+# Legacy alias (usar STAGE2_PIXEL_INPUT_SIZE)
+STAGE2_PIXEL_SEG_SIZE: int = 224
+
+# --- Slice Multi-Similarity metric loss (Wang et al. 2019) sobre embeddings de píxel ---
+STAGE2_PIXEL_MS_LOSS_ENABLED: bool = True   # metric learning aux; estructura el espacio, robusto a ruido de label
+STAGE2_PIXEL_MS_WEIGHT: float = 0.5
+STAGE2_PIXEL_MS_SLICES: int = 4
+STAGE2_PIXEL_MS_K_PER_CLASS: int = 256
+STAGE2_PIXEL_MS_ALPHA: float = 2.0
+STAGE2_PIXEL_MS_BETA: float = 50.0
+STAGE2_PIXEL_MS_BASE: float = 0.5
+
+# --- Loss principal densa ---
+STAGE2_PIXEL_LOSS_TYPE: str = "ce"               # "ce" | "focal" (focal era parche anti-colapso; con labels stain-aware + MS, CE es más limpia)
+STAGE2_PIXEL_FOCAL_GAMMA: float = 2.0            # gamma para focal loss
+STAGE2_PIXEL_CLASS_WEIGHTS: str = "inv_freq"     # "uniform" | "inv_freq" | "inv_sqrt"
+STAGE2_PIXEL_DECODER_TYPE: str = "multiscale"    # "simple" | "multiscale"
+STAGE2_PIXEL_AUX_ENTROPY_LOSS: bool = True       # loss auxiliar stage2 gold
+STAGE2_PIXEL_AUX_ENTROPY_WEIGHT: float = 0.1     # peso de la loss auxiliar
+STAGE2_PIXEL_AUGMENT_H5: bool = True             # augmentación en path H5
+STAGE2_PIXEL_UNFREEZE_LAST_N: int = 2            # descongelar últimos N bloques backbone
+
+# --- MEViT explicabilidad (E2-EX) ---
+STAGE2_PIXEL_EXPLAIN_ENABLED: bool = True
+STAGE2_PIXEL_EXPLAIN_ATTENTION_LAYERS: str = "last"  # all | last | 0,5,11
+STAGE2_PIXEL_EXPLAIN_EXPORT_PROBS: bool = True
+STAGE2_PIXEL_EXPLAIN_EXPORT_PRIORS: bool = True
+STAGE2_PIXEL_EXPLAIN_NARRATIVE: bool = True
+
+# --- Posttrain automático tras cada entrenamiento ---
+STAGE2_PIXEL_POSTTRAIN_FULL_REPORT: bool = True
+STAGE2_PIXEL_POSTTRAIN_SKIP_FULLIMAGE: bool = False  # mapas full-image secuenciales Gate→Stage2
+STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_VAL: int = 6
+STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_TEST: int = 6
+STAGE2_PIXEL_POSTTRAIN_EXPLAIN_PANELS: bool = True
+STAGE2_GATE_INFERENCE_STRICT: bool = True  # Modelo 1: sin fallback a gold stage1 del manifest
+STAGE2_POSTTRAIN_REQUIRE_GATE_CACHE: bool = True  # exige build-gate-cache antes de full-image
+
+# --- MEViT prior losses (E2-EX.2) ---
+STAGE2_PIXEL_PRIOR_LOSS_ENABLED: bool = True
+STAGE2_PIXEL_PRIOR_LOSS_IH_WEIGHT: float = 0.05
+STAGE2_PIXEL_PRIOR_LOSS_V_WEIGHT: float = 0.05
+STAGE2_PIXEL_PRIOR_LOSS_PREC_WEIGHT: float = 0.02
+STAGE2_PIXEL_PRIOR_LOSS_A_WEIGHT: float = 0.03  # P3.2: activado gradual (prior v3, A=textura×gate densidad). Sweep 0.02/0.05/0.08 pendiente de refinamiento.
+STAGE2_PIXEL_PRIOR_LOSS_WORKERS: int = 4  # solo si priors NO están en HDF5 (fallback runtime)
+

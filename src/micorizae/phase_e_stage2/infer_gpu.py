@@ -17,7 +17,7 @@ from ..common.logging_utils import get_logger
 from ..common.paths import get_paths
 from ..phase_d_stage1.gpu_pipeline import iter_image_batches, plan_epoch
 from .class_map import Stage2ClassMap, load_stage2_class_map
-from .fusion import DEFAULT_WEIGHTS, entropy, fuse_probabilities_mc, js_divergence_mc
+from .fusion import DEFAULT_WEIGHTS, _active_branch_weights, entropy, fuse_probabilities_mc, js_divergence_mc
 from .gpu_pipeline import GPUStage2Batch, iter_image_batches_stage2, plan_epoch_stage2
 
 log = get_logger("phase_e.infer_gpu")
@@ -65,6 +65,7 @@ def infer_tiles_stage2_gpu(
 
     rows_all, cols_all = [], []
     pa_all, pb_all, pc_all = [], [], []
+    active = _active_branch_weights(ensemble.weights)
 
     dev = ensemble.device
     iterator = tqdm(
@@ -75,22 +76,30 @@ def infer_tiles_stage2_gpu(
     )
     for batch in iterator:
         with torch.autocast(device_type=dev.type, enabled=use_amp and dev.type == "cuda"):
-            la = ensemble.branch_a(batch.rgb) / ensemble.temp_a
-            lb = ensemble.branch_b(batch.seg) / ensemble.temp_b
-            lc = ensemble.branch_c(batch.freq) / ensemble.temp_c
-        pa_all.append(_softmax_np(la))
-        pb_all.append(_softmax_np(lb))
-        pc_all.append(_softmax_np(lc))
+            if "A" in active:
+                la = ensemble.branch_a(batch.rgb) / ensemble.temp_a
+                pa_all.append(_softmax_np(la))
+            if "B" in active:
+                lb = ensemble.branch_b(batch.seg) / ensemble.temp_b
+                pb_all.append(_softmax_np(lb))
+            if "C" in active:
+                lc = ensemble.branch_c(batch.freq) / ensemble.temp_c
+                pc_all.append(_softmax_np(lc))
         rows_all.extend(batch.rows.cpu().tolist())
         cols_all.extend(batch.cols.cpu().tolist())
 
-    p_a = np.concatenate(pa_all, axis=0) if pa_all else np.zeros((0, cmap.num_classes))
-    p_b = np.concatenate(pb_all, axis=0) if pb_all else np.zeros((0, cmap.num_classes))
-    p_c = np.concatenate(pc_all, axis=0) if pc_all else np.zeros((0, cmap.num_classes))
-    probs = {"A": p_a, "B": p_b, "C": p_c}
+    n = len(rows_all)
+    p_a = np.concatenate(pa_all, axis=0) if pa_all else np.zeros((n, cmap.num_classes))
+    p_b = np.concatenate(pb_all, axis=0) if pb_all else np.zeros((n, cmap.num_classes))
+    p_c = np.concatenate(pc_all, axis=0) if pc_all else np.zeros((n, cmap.num_classes))
+    probs = {k: v for k, v in (("A", p_a), ("B", p_b), ("C", p_c)) if k in active}
     p_fused = fuse_probabilities_mc(probs, weights=ensemble.weights or DEFAULT_WEIGHTS)
     ent = entropy(p_fused)
-    consensus = 1.0 - np.clip(js_divergence_mc(probs) / np.log(2.0), 0, 1)
+    consensus = (
+        1.0 - np.clip(js_divergence_mc(probs) / np.log(2.0), 0, 1)
+        if len(probs) > 1
+        else np.ones(n, dtype=np.float64)
+    )
     pred_idx = p_fused.argmax(axis=-1)
 
     order_df = pd.DataFrame({

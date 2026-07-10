@@ -1602,6 +1602,224 @@ def evaluate_gate_tile_dino_on_df(
     return pd.concat(parts, ignore_index=True)
 
 
+@dataclass
+class GateProbeBundle:
+    """Gate Slice-MS probe + cache embeddings + prototipos (modo vigente)."""
+
+    classifier: nn.Module
+    embed_store: object
+    prototype_bank: Optional[object]
+    slice_ms_only: bool
+    device: torch.device
+    checkpoint_meta: dict
+    gate_run_id: str = ""
+
+
+def _is_probe_state_dict(state: dict) -> bool:
+    keys = list(state.keys())
+    return any(k.startswith("encoder.") for k in keys) and any(k.startswith("gate_head") for k in keys)
+
+
+def load_gate_probe_bundle(
+    *,
+    device: torch.device | None = None,
+    ckpt_dir: Path | None = None,
+    cfg: Optional[object] = None,
+    gate_run_id: str = "",
+) -> GateProbeBundle:
+    """Carga probe Slice-MS + memmap embed + prototipos desde checkpoint gate AM."""
+    import config as user_config  # type: ignore
+
+    from ..common.paths import get_paths
+    from ..gate_runflow import (
+        _cache_basename_from_cfg,
+        _open_gate_h5_store,
+        _probe_in_dim,
+        gate_train_params_from_config,
+        resolve_gate_am_splits,
+    )
+    from .gate4.probe_model import build_gate_slice_probe
+    from .gate_embed_cache import inspect_embed_cache_status, open_gate_embed_store
+    from .gate_metric_inference import prototype_bank_from_gate4
+
+    cfg = cfg or user_config
+    paths = get_paths()
+    ckpt_dir = ckpt_dir or (paths.root / "models" / "checkpoints" / "gate_am")
+    device = device or torch.device("cuda")
+    ckpt = ckpt_dir / CHECKPOINT_NAME
+    if not ckpt.exists():
+        raise FileNotFoundError(
+            f"Falta checkpoint: {ckpt}. Entrena con: python run.py train-gate-am"
+        )
+
+    params = gate_train_params_from_config(cfg)
+    include_unknown = bool(params.gate4.include_unknown_in_split) if params.gate4 else False
+    train_df, _val_df, _ext, _info, cache_tiles = resolve_gate_am_splits(
+        cfg, exclude_unreadable=not include_unknown
+    )
+    train_images = set(train_df["image_path"].astype(str))
+
+    status = inspect_embed_cache_status(
+        cache_tiles,
+        backbone_name=params.backbone,
+        dino_input_size=params.dino_input_size,
+        mplus_aug_variants=params.mplus_aug_variants,
+        mplus_aug_train_images=train_images,
+        cache_attention=params.cache_attention,
+        attention_layers=params.attention_layers,
+        attention_head_reduce=params.attention_head_reduce,
+        cache_basename=_cache_basename_from_cfg(cfg),
+    )
+    if status.state not in {"valid", "stale", "obsolete"}:
+        raise RuntimeError(f"Cache embeddings no usable ({status.state})")
+    embed_store = open_gate_embed_store(status.paths)
+
+    probe_in = _probe_in_dim(params, status.paths)
+    g4 = params.gate4
+    if g4 is None or not g4.enabled:
+        raise RuntimeError("Gate4 deshabilitado; no se puede cargar probe Slice-MS.")
+    classifier = build_gate_slice_probe(
+        in_dim=probe_in,
+        embed_dim=g4.embed_dim,
+        num_slices=g4.num_slices,
+        num_classes=len(GATE_CLASS_NAMES),
+    )
+
+    st = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if not _is_probe_state_dict(st.get("model_state_dict", {})):
+        raise RuntimeError(
+            "Checkpoint no es probe Slice-MS (faltan claves encoder.*). "
+            "Reentrena gate o usa checkpoint gate_tile_dino_best.pt actual."
+        )
+    classifier.load_state_dict(st["model_state_dict"])
+    classifier.to(device).eval()
+
+    slice_ms_only = str(st.get("loss_type", "slice_ms_only")) == "slice_ms_only"
+    proto = None
+    if slice_ms_only and "prototype_bank" in st:
+        proto = prototype_bank_from_gate4(g4, num_classes=len(GATE_CLASS_NAMES), device=device)
+        proto.load_state_dict(st["prototype_bank"])
+
+    run_id = gate_run_id or str(getattr(cfg, "STAGE2_GATE_RUN_ID", "") or "")
+    log.info(
+        f"[Gate probe] cargado acc={st.get('acc', 0):.4f} "
+        f"macro_f1={st.get('macro_f1', 0):.4f} min_recall={st.get('min_class_recall', 0):.4f} "
+        f"run_ref={run_id or 'n/a'}"
+    )
+    return GateProbeBundle(
+        classifier=classifier,
+        embed_store=embed_store,
+        prototype_bank=proto,
+        slice_ms_only=slice_ms_only,
+        device=device,
+        checkpoint_meta=st,
+        gate_run_id=run_id,
+    )
+
+
+@torch.no_grad()
+def infer_image_gate_probe_gpu(
+    image_path: str | Path,
+    bundle: GateProbeBundle,
+    tiles_index_path: Optional[Path] = None,
+    *,
+    batch_size: int = 64,
+    strict: bool = False,
+    tile_scope_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Inferencia gate desde cache embed (probe + prototipos) para una imagen.
+
+    ``strict=True``: si faltan tiles en embed cache, lanza error en lugar de
+    rellenar con gold ``stage1`` del manifest (incorrecto para pipeline secuencial).
+
+    ``tile_scope_df``: restringe a la malla Gate (p. ej. ``cache_tiles`` de
+    ``resolve_gate_am_splits``); evita mezclar densidades del manifest.
+    """
+    import numpy as np
+    from ..common.io import read_table
+    from ..common.paths import get_paths
+
+    paths = get_paths()
+    df = read_table(tiles_index_path or (paths.manifests / "tiles_index"))
+    rel = Path(image_path).resolve().relative_to(paths.root).as_posix()
+    sub = df[df["image_path"] == rel].copy().reset_index(drop=True)
+    if tile_scope_df is not None and not sub.empty:
+        scope = tile_scope_df[tile_scope_df["image_path"].astype(str) == rel].copy()
+        key_cols = ["row", "col"]
+        if "tile_size" in scope.columns and scope["tile_size"].notna().any():
+            key_cols.append("tile_size")
+        sub = sub.merge(scope[key_cols].drop_duplicates(), on=key_cols, how="inner").reset_index(drop=True)
+    if sub.empty:
+        log.warning(f"No hay tiles para {rel} en el manifest")
+        return sub
+
+    gold = sub.copy()
+    pred_cache = evaluate_gate_probe_on_df(
+        bundle.classifier,
+        sub,
+        bundle.embed_store,
+        bundle.device,
+        batch_size=batch_size,
+        prototype_bank=bundle.prototype_bank,
+        slice_ms_only=bundle.slice_ms_only,
+    )
+    pred_cols = ["row", "col", "gate_pred_idx", "stage1_pred", "p_bg", "p_mminus", "p_mplus"]
+    pred_key = ["row", "col"]
+    if "tile_size" in sub.columns and sub["tile_size"].notna().any():
+        pred_key = ["row", "col", "tile_size"]
+        if "tile_size" not in pred_cache.columns:
+            pred_key = ["row", "col"]
+    merge_cols = pred_key + pred_cols[len(pred_key):]
+    if pred_cache.empty:
+        if strict:
+            raise RuntimeError(
+                f"[Gate probe] sin embeddings para {rel} ({len(sub)} tiles). "
+                "Ejecuta: python run.py build-gate-cache antes de Stage2."
+            )
+        merged = gold.copy()
+        for c in merge_cols[len(pred_key) :]:
+            merged[c] = np.nan
+    else:
+        merged = gold.merge(pred_cache[merge_cols], on=pred_key, how="left")
+
+    if merged["stage1_pred"].isna().any():
+        from .gate_classes import decode_gate_indices
+
+        n_miss = int(merged["stage1_pred"].isna().sum())
+        if strict:
+            raise RuntimeError(
+                f"[Gate probe] cache incompleto para {rel}: "
+                f"{len(pred_cache)}/{len(sub)} tiles con embed; faltan {n_miss}. "
+                "Ejecuta: python run.py build-gate-cache "
+                "(no usar gold stage1 como sustituto del Modelo 1)."
+            )
+        log.warning(
+            f"[Gate probe] cache parcial ({len(pred_cache)}/{len(sub)} tiles); "
+            f"fallback gold stage1 en {n_miss} tiles."
+        )
+        merged["stage1_pred"] = merged["stage1_pred"].astype("object")
+        for idx, row in merged[merged["stage1_pred"].isna()].iterrows():
+            s1 = str(row["stage1"]).strip()
+            if s1 == "Mplus":
+                gidx = 2
+            elif s1 == "Mminus":
+                gidx = 1
+            elif s1 == "Background":
+                gidx = 0
+            else:
+                gidx = 3
+            merged.at[idx, "gate_pred_idx"] = gidx
+            merged.at[idx, "stage1_pred"] = decode_gate_indices(np.array([gidx]))[0]
+            merged.at[idx, "p_bg"] = 1.0 if gidx == 0 else 0.0
+            merged.at[idx, "p_mminus"] = 1.0 if gidx == 1 else 0.0
+            merged.at[idx, "p_mplus"] = 1.0 if gidx == 2 else 0.0
+
+    merged["is_mplus"] = (merged["gate_pred_idx"] == 2).astype(int)
+    merged["p_fused_max"] = merged[["p_bg", "p_mminus", "p_mplus"]].max(axis=1)
+    merged["stage1"] = merged["stage1_pred"]
+    return merged
+
+
 def load_gate_tile_dino(
     *,
     backbone: str = "dinov2_vits14",
@@ -1614,16 +1832,20 @@ def load_gate_tile_dino(
 
     paths = get_paths()
     ckpt_dir = ckpt_dir or (paths.root / "models" / "checkpoints" / "gate_am")
-    weights_dir = weights_dir or (paths.root / "models" / "weights")
     device = device or torch.device("cuda")
 
-    classifier = build_branch_a(backbone_name=backbone, num_classes=num_classes)
     ckpt = ckpt_dir / CHECKPOINT_NAME
     if not ckpt.exists():
         raise FileNotFoundError(
             f"Falta checkpoint: {ckpt}. Entrena con: python run.py train-gate-am"
         )
     st = torch.load(ckpt, map_location="cpu", weights_only=False)
-    classifier.load_state_dict(st["model_state_dict"])
+    state = st.get("model_state_dict", {})
+    if _is_probe_state_dict(state):
+        bundle = load_gate_probe_bundle(device=device, ckpt_dir=ckpt_dir)
+        return GateTileDinoGPU(classifier=bundle.classifier, device=device).to(device)
+
+    classifier = build_branch_a(backbone_name=backbone, num_classes=num_classes)
+    classifier.load_state_dict(state)
     log.info(f"[Gate tile] checkpoint acc={st.get('acc', 0):.4f} macro_f1={st.get('macro_f1', 0):.4f}")
     return GateTileDinoGPU(classifier=classifier, device=device).to(device)

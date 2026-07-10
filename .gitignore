@@ -1,82 +1,109 @@
-# Entorno virtual del proyecto
+# =============================================================================
+# MicorizaeVision / MicoViT — primera subida: SOLO código + README.md
+# Todo lo demás queda fuera del repositorio (datos, artefactos, docs internas).
+# =============================================================================
+
+# --- Entorno Python ---
 .venv/
 venv/
 env/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+.env
+.env.*
 *.egg-info/
+__pycache__/
+*.py[cod]
+*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
 
-# Datos pesados (los CSV pequeños sí se versionan; las imágenes no)
-Data/**/*.jpg
-Data/**/*.jpeg
-Data/**/*.png
-Data/**/*.tif
-Data/**/*.tiff
+# --- Datos e imágenes (NUNCA subir) ---
+Data/
+data/
+**/Data/**
+**/*.jpg
+**/*.jpeg
+**/*.png
+**/*.tif
+**/*.tiff
+**/*.bmp
+**/*.webp
+**/*.csv
+!configs/**/*.yaml
 
-# Salidas
+# --- Manifests, salidas, modelos, cache (generados en runtime) ---
 manifests/
 outputs/
 runs/
+models/
 checkpoints/
+cache/
+locks/
+*.lock
+
+# --- Artefactos ML / binarios pesados ---
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.npz.*
 *.parquet
 *.pt
 *.pth
 *.ckpt
-*.h5
+*.onnx
+*.safetensors
+*.pkl
+*.pickle
+*.joblib
 
-# IDE / OS
+# --- Documentación interna (excepto README.md en la raíz) ---
+Docs/
+docs/
+*.md
+!README.md
+
+# --- Logs y temporales ---
+logs/
+*.log
+*.err
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# --- IDE / editor / Cursor (reglas locales, no subir) ---
+.cursor/
 .vscode/
 .idea/
+*.code-workspace
+*.sublime-*
+
+# --- OS ---
 .DS_Store
 Thumbs.db
-*.log
+desktop.ini
 
-# Documentación
-Docs/
-*.md
-
-# Data
-Data/
-Data/**/
-
-# Zips
+# --- Archivos comprimidos / dumps ---
 *.zip
 *.tar
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.lzma
-*.tar.lz
-*.tar.lz4
-*.tar.zstd
-*.tar.z
+*.tar.*
+*.7z
+*.rar
 
-# Big Data
-*.h5
-*.npy
-*.npz
-*.npz.gz
-*.npz.gz.part
-*.npz.gz.part.1
-*.npz.gz.part.2
-*.npz.gz.part.3
-*.npz.gz.part.4
-*.npz.gz.part.5
+# --- Secretos (por si acaso) ---
+secrets/
+credentials/
+*.pem
+*.key
+id_rsa*
+*.p12
 
-# Cache
-cache/
-cache/**/
-
-# Locks
-locks/
-locks/**/
-
-# logs
-*.log/**/
+# --- Canvas / feeds locales Cursor (no código) ---
+canvases/
+**/canvases/

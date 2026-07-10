@@ -1224,20 +1224,40 @@ def infer_gate_am_cmd(
 
 @app.command(name="train-stage2")
 def train_stage2_cmd(
-    lineage: str = typer.Option("AM", help="Linaje: AM o ERM"),
-    backbone: str = typer.Option("dinov2_vits14", help="Backbone Branch A"),
-    epochs: int = typer.Option(3, help="Epocas por rama"),
-    batch_size: int = typer.Option(16, help="Batch size"),
-    val_fraction: float = typer.Option(0.2, help="Fraccion de imagenes para validacion"),
-    max_train_batches: int = typer.Option(40, help="Max batches por epoca (smoke)"),
-    max_val_batches: int = typer.Option(15, help="Max batches validacion"),
+    lineage: str = typer.Option(None, help="Linaje: AM o ERM (default config.py)"),
+    backbone: str = typer.Option(None, help="Backbone Branch A"),
+    epochs: int = typer.Option(None, help="Epocas por rama"),
+    batch_size: int = typer.Option(None, help="Batch size"),
+    val_fraction: float = typer.Option(None, help="Fraccion de imagenes para validacion"),
+    max_train_batches: int = typer.Option(None, help="Max batches por epoca (None=sin limite)"),
+    max_val_batches: int = typer.Option(None, help="Max batches validacion"),
     skip_a: bool = typer.Option(False, help="Saltar rama A"),
-    skip_b: bool = typer.Option(False, help="Saltar rama B"),
-    skip_c: bool = typer.Option(False, help="Saltar rama C"),
-    use_amp: bool = typer.Option(False, help="AMP"),
+    skip_b: bool = typer.Option(None, help="Saltar rama B"),
+    skip_c: bool = typer.Option(None, help="Saltar rama C"),
+    use_amp: bool = typer.Option(None, help="AMP"),
+    full: bool = typer.Option(False, help="Entrenamiento formal sin cap de batches"),
+    legacy_tile: bool = typer.Option(
+        False,
+        help="Prototipo tile AMColonised/Hybrid (obsoleto). Por defecto → Stage2-Pixel ViT.",
+    ),
 ):
-    """Fase E — Entrena Stage2 multiclas e (solo tiles M+) por linaje, 100% CUDA."""
+    """Fase E — Entrena Stage2-Pixel ViT (IH/A/V/H píxel). Alias de train-stage2-pixel."""
+    if bool(_cfg("STAGE2_PIXEL_ENABLED", True)) and not legacy_tile:
+        log.info(
+            "[Stage2-Pixel ViT] train-stage2 → entrenamiento morfológico píxel "
+            "(único entrenamiento Fase E; gate tile AMColonised/Hybrid es legacy con --legacy-tile)"
+        )
+        return train_stage2_pixel_cmd(
+            epochs=epochs,
+            batch_size=batch_size,
+            val_fraction=val_fraction,
+            full=full or True,
+        )
+
+    log.warning("[Stage2 legacy tile] AMColonised/Hybrid — prototipo obsoleto; usar Stage2-Pixel ViT.")
     import json
+
+    import pandas as pd
     import torch
 
     from .phase_e_stage2 import (
@@ -1252,18 +1272,51 @@ def train_stage2_cmd(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA no disponible. Este pipeline es GPU-only sin fallback.")
 
-    lineage = lineage.upper()
+    lineage = str(lineage or _cfg("STAGE2_LINEAGE_DEFAULT", "AM")).upper()
+    backbone = backbone or str(_cfg("STAGE2_BACKBONE", "dinov2_vits14"))
+    epochs = int(epochs if epochs is not None else _cfg("STAGE2_EPOCHS", 30))
+    batch_size = int(batch_size if batch_size is not None else _cfg("STAGE2_BATCH_SIZE", 16))
+    val_fraction = float(
+        val_fraction if val_fraction is not None else _cfg("STAGE2_VAL_FRACTION", 0.2)
+    )
+    skip_b = bool(_cfg("STAGE2_SKIP_B", True)) if skip_b is None else skip_b
+    skip_c = bool(_cfg("STAGE2_SKIP_C", True)) if skip_c is None else skip_c
+    use_amp = bool(_cfg("STAGE2_USE_AMP", True)) if use_amp is None else use_amp
+    loss_type = str(_cfg("STAGE2_LOSS", "ce"))
+    focal_gamma = float(_cfg("STAGE2_FOCAL_GAMMA", 2.0))
+    hybrid_os = int(_cfg("STAGE2_HYBRID_OVERSAMPLE", 1))
+    gate_run_id = str(_cfg("STAGE2_GATE_RUN_ID", ""))
+
+    if full:
+        max_train_batches = None
+        max_val_batches = None
+    elif max_train_batches is None:
+        max_train_batches = 40
+    if max_val_batches is None and not full:
+        max_val_batches = 15
+
     paths = get_paths()
-    run = RunOutputs.create("stage2_train", suffix=lineage)
+    run_suffix = f"{lineage}__gate{gate_run_id}" if gate_run_id else lineage
+    run = RunOutputs.create("stage2_train", suffix=run_suffix)
     device = torch.device("cuda")
 
+    subsets_raw = str(_cfg("STAGE2_TRAIN_SUBSETS", "am_train") or "")
+    subsets = [s.strip() for s in subsets_raw.split(",") if s.strip()] or None
+
     train_df, val_df, info_split, class_map = split_by_image_mplus(
-        lineage=lineage, val_fraction=val_fraction,
+        lineage=lineage, val_fraction=val_fraction, subsets=subsets,
     )
+    if hybrid_os > 1 and "Hybrid" in train_df["stage2"].values:
+        hybrid_rows = train_df[train_df["stage2"] == "Hybrid"]
+        extras = [hybrid_rows] * (hybrid_os - 1)
+        train_df = pd.concat([train_df] + extras, ignore_index=True)
+        info_split["hybrid_oversample"] = hybrid_os
+        info_split["n_train_tiles_after_oversample"] = int(len(train_df))
+
     log.info(
         f"[Fase E] lineage={lineage} classes={list(class_map.classes)} "
-        f"train_tiles={info_split['n_train_tiles']} val_tiles={info_split['n_val_tiles']} "
-        f"run={run.run_id}"
+        f"train_tiles={len(train_df)} val_tiles={len(val_df)} "
+        f"gate_ref={gate_run_id} run={run.run_id}"
     )
 
     ckpt_dir = paths.root / "models" / "checkpoints" / f"stage2_{lineage.lower()}"
@@ -1273,7 +1326,11 @@ def train_stage2_cmd(
 
     branches: list[tuple[str, torch.nn.Module]] = []
     if not skip_a:
-        a = build_branch_a_mc(n_cls, backbone_name=backbone)
+        a = build_branch_a_mc(
+            n_cls,
+            backbone_name=backbone,
+            freeze_backbone=bool(_cfg("STAGE2_FREEZE_BACKBONE", False)),
+        )
         log.info(f"[Branch A] {backbone} params={count_parameters(a):,}")
         branches.append(("A", a))
     if not skip_b:
@@ -1301,24 +1358,600 @@ def train_stage2_cmd(
             use_amp=use_amp,
             max_train_batches=max_train_batches,
             max_val_batches=max_val_batches,
+            lr=float(_cfg("STAGE2_LR", 1e-4)),
+            backbone_lr_factor=float(_cfg("STAGE2_BACKBONE_LR_FACTOR", 0.1)),
+            loss_type=loss_type,
+            focal_gamma=focal_gamma,
         )
         history_all[name] = history.to_dict()
 
+    meta = {
+        "run_id": run.run_id,
+        "lineage": lineage,
+        "classes": list(class_map.classes),
+        "backbone_a": backbone,
+        "device": str(device),
+        "history": history_all,
+        "split_info": info_split,
+        "gate_run_id": gate_run_id,
+        "plan_doc": "Docs/20260628_225244_PLAN_VIT_STAGE2_DISCRIMINADOR_MPLUS.md",
+        "vit_s2": True,
+    }
     report_path = run.reports / "stage2_train_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "run_id": run.run_id,
-                "lineage": lineage,
-                "classes": list(class_map.classes),
-                "backbone_a": backbone,
-                "device": str(device),
-                "history": history_all,
-                "split_info": info_split,
-            },
-            f, indent=2,
-        )
+        json.dump(meta, f, indent=2)
+    (run.root / "STAGE2_RUN_META.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     log.info(f"[Fase E] [bold green]OK[/bold green] -> {report_path}")
+
+
+@app.command(name="build-stage2-pixel-cache")
+def build_stage2_pixel_cache_cmd(
+    force_rebuild: bool = typer.Option(
+        False,
+        "--force-rebuild",
+        help="Rehace rgb/label desde imágenes (además de priors). Por defecto solo re-materializa priors si el fingerprint cambió.",
+    ),
+):
+    """Paso 1 del pipeline Fase 2 (orquestado): conforma/actualiza el HDF5 Stage2-Pixel.
+
+    Reutiliza el MISMO generador que ``train-stage2-pixel`` (``ensure_stage2_pixel_h5_cache``):
+    valida ``rgb``/``label`` contra el fingerprint morph (no los toca si siguen válidos) y
+    re-materializa ``prior_evidence``/``prior_vesicle`` multihilo cuando cambia
+    ``PRIOR_IMPL_VERSION`` (p. ej. v2 a v3). Permite reconstruir priors sin entrenar.
+    """
+    import torch
+
+    from .phase_e_stage2.pixel_data import load_mplus_splits
+    from .phase_e_stage2.pixel_morph import PixelMorphParams
+    from .phase_e_stage2.stage2_pixel_h5_cache import (
+        collect_mplus_tiles_for_h5,
+        ensure_stage2_pixel_h5_cache,
+    )
+    from .phase_i_weakseg.pipeline import WeakSegParams
+
+    gate_run_id = str(_cfg("STAGE2_PIXEL_GATE_RUN_ID", _cfg("STAGE2_GATE_RUN_ID", "")))
+    input_size = int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224))
+    val_fraction = float(_cfg("STAGE2_PIXEL_VAL_FRACTION", 0.2))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    morph = PixelMorphParams(
+        weak=WeakSegParams(
+            vesicle_circularity_min=float(_cfg("STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN", 0.85)),
+            frangi_pctl=float(_cfg("STAGE2_PIXEL_FRANGI_PCTL", 82.0)),
+            arbuscule_pctl=float(_cfg("STAGE2_PIXEL_ARBUSCULE_PCTL", 93.0)),
+        ),
+        seam_sigma=0.0,
+    )
+
+    train_df, val_df, test_df, split_info = load_mplus_splits(val_fraction=val_fraction)
+    combined_df = collect_mplus_tiles_for_h5(train_df, val_df, test_df)
+    log.info(
+        f"[Stage2-Pixel] build-cache: {len(combined_df):,} tiles M+ (Fase 1 gate={gate_run_id}) "
+        f"-> cache/stage2_pixel_mplus_v1.h5"
+    )
+    _w = int(_cfg("STAGE2_PIXEL_H5_BUILD_WORKERS", 0))
+    _w_label = str(_w) if _w > 0 else "auto"
+    print(
+        f"[Stage2-Pixel] build-cache: {len(combined_df):,} tiles M+ | "
+        f"force_rebuild={force_rebuild} | {_w_label} workers CPU (rgb+label+priors)",
+        flush=True,
+    )
+    h5_store = ensure_stage2_pixel_h5_cache(
+        combined_df,
+        morph,
+        device=device,
+        input_size=input_size,
+        gate_run_id=gate_run_id,
+        batch_size=int(_cfg("STAGE2_PIXEL_H5_BUILD_BATCH", 8)),
+        compression=str(_cfg("STAGE2_PIXEL_H5_COMPRESSION", "lzf")),
+        force_rebuild=bool(force_rebuild),
+        store_priors=bool(_cfg("STAGE2_PIXEL_H5_STORE_PRIORS", True)),
+        workers=_w if _w > 0 else None,
+    )
+    print(
+        f"[Stage2-Pixel] build-cache LISTO -> {h5_store.h5_path} | "
+        f"priors_in_h5={bool(getattr(h5_store, 'has_priors', False))}",
+        flush=True,
+    )
+
+
+@app.command(name="train-stage2-pixel")
+def train_stage2_pixel_cmd(
+    epochs: Optional[int] = typer.Option(None, help="Épocas (default config STAGE2_PIXEL_EPOCHS=20)"),
+    batch_size: Optional[int] = typer.Option(None, help="Batch size tiles"),
+    val_fraction: Optional[float] = typer.Option(None, help="Fracción val por imagen"),
+    full: bool = typer.Option(True, help="Entrenamiento formal completo"),
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run-id",
+        help="Corrida existente en outputs/ (resume). Si se omite, crea run nuevo.",
+    ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Continuar desde último checkpoint en pretrain/checkpoints/epoch_NNN.pt",
+    ),
+):
+    """Fase E — Stage2-Pixel: ViT DINOv2 segmentación morfológica IH/A/V/H (entrenamiento formal)."""
+    import torch
+
+    from .common.run_outputs import RunOutputs
+    from .phase_e_stage2.pixel_data import load_mplus_splits
+    from .phase_e_stage2.pixel_morph import PixelMorphParams
+    from .phase_e_stage2.pixel_vit_model import build_pixel_morph_vit
+    from .phase_e_stage2.stage2_pixel_run_layout import (
+        build_run_meta,
+        finalize_posttrain,
+        find_latest_epoch_checkpoint,
+        is_posttrain_complete,
+        layout_for_run,
+        layout_from_run_root,
+        load_training_state,
+        recover_stage2_pixel_run,
+        write_pretrain_setup,
+        write_training_profile,
+    )
+    from .phase_e_stage2.train_pixel_gpu import (
+        PixelTrainHistory,
+        load_resume_checkpoint,
+        train_pixel_morph_gpu,
+    )
+    from .phase_e_stage2.pixel_prior_loss import PriorLossWeights
+    from .phase_i_weakseg.pipeline import WeakSegParams
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA no disponible.")
+
+    epochs = int(epochs if epochs is not None else _cfg("STAGE2_PIXEL_EPOCHS", 40))
+    batch_size = int(batch_size if batch_size is not None else _cfg("STAGE2_PIXEL_BATCH_SIZE", 8))
+    val_fraction = float(
+        val_fraction if val_fraction is not None else _cfg("STAGE2_PIXEL_VAL_FRACTION", 0.2)
+    )
+    gate_run_id = str(_cfg("STAGE2_PIXEL_GATE_RUN_ID", _cfg("STAGE2_GATE_RUN_ID", "")))
+    use_amp = bool(_cfg("STAGE2_PIXEL_USE_AMP", True))
+    input_size = int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224))
+    vit_name = str(_cfg("STAGE2_PIXEL_VIT_MODEL", "dinov2_vits14"))
+    freeze_bb = bool(_cfg("STAGE2_PIXEL_FREEZE_BACKBONE", True))
+
+    paths = get_paths()
+    if run_id:
+        run = RunOutputs.open(run_id)
+        layout = layout_from_run_root(run.root)
+    else:
+        if resume:
+            raise typer.BadParameter("--resume requiere --run-id de corrida existente")
+        run = RunOutputs.create("stage2_pixel_train", suffix=f"AM__gate{gate_run_id}")
+        layout = layout_for_run(run)
+    device = torch.device("cuda")
+
+    train_df, val_df, test_df, split_info = load_mplus_splits(val_fraction=val_fraction)
+    morph = PixelMorphParams(
+        weak=WeakSegParams(
+            vesicle_circularity_min=float(_cfg("STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN", 0.85)),
+            frangi_pctl=float(_cfg("STAGE2_PIXEL_FRANGI_PCTL", 82.0)),
+            arbuscule_pctl=float(_cfg("STAGE2_PIXEL_ARBUSCULE_PCTL", 93.0)),
+        ),
+        seam_sigma=0.0,
+    )
+
+    h5_store = None
+    h5_meta: dict = {"enabled": False}
+    if bool(_cfg("STAGE2_PIXEL_H5_ENABLED", True)):
+        from .phase_e_stage2.stage2_pixel_h5_cache import (
+            collect_mplus_tiles_for_h5,
+            ensure_stage2_pixel_h5_cache,
+        )
+
+        combined_df = collect_mplus_tiles_for_h5(train_df, val_df, test_df)
+        log.info(
+            f"[Stage2-Pixel] Paso 1/2: HDF5 cache ({len(combined_df):,} tiles M+) "
+            f"-> cache/stage2_pixel_mplus_v1.h5"
+        )
+        _w = int(_cfg("STAGE2_PIXEL_H5_BUILD_WORKERS", 0))
+        h5_store = ensure_stage2_pixel_h5_cache(
+            combined_df,
+            morph,
+            device=device,
+            input_size=input_size,
+            gate_run_id=gate_run_id,
+            batch_size=int(_cfg("STAGE2_PIXEL_H5_BUILD_BATCH", batch_size)),
+            compression=str(_cfg("STAGE2_PIXEL_H5_COMPRESSION", "lzf")),
+            force_rebuild=bool(_cfg("STAGE2_PIXEL_H5_FORCE_REBUILD", False)),
+            store_priors=bool(_cfg("STAGE2_PIXEL_H5_STORE_PRIORS", True)),
+            workers=_w if _w > 0 else None,
+        )
+        h5_meta = {
+            "enabled": True,
+            "path": str(h5_store.h5_path),
+            "n_tiles": int(len(combined_df)),
+            "priors_in_h5": bool(getattr(h5_store, "has_priors", False)),
+        }
+        if bool(_cfg("STAGE2_PIXEL_H5_RAM_CACHE", True)):
+            h5_store.ensure_ram_cache(enabled=True)
+            h5_meta["ram_cache"] = True
+        log.info("[Stage2-Pixel] Perfil conformación HDF5...")
+        profile_on_train = bool(_cfg("STAGE2_PIXEL_H5_PROFILE_ON_TRAIN", False))
+        force_rebuild = bool(_cfg("STAGE2_PIXEL_H5_FORCE_REBUILD", False))
+        if profile_on_train or force_rebuild:
+            from .phase_e_stage2.stage2_pixel_h5_profile import build_h5_conformation_profile
+
+            build_h5_conformation_profile(
+                h5_path=h5_store.h5_path,
+                lookup_path=paths.root / "cache" / "stage2_pixel_mplus_v1.lookup.parquet",
+                v_min_px=int(_cfg("STAGE2_PIXEL_V_MIN_PX", 30)),
+            )
+        else:
+            log.info("[Stage2-Pixel] Perfil HDF5 omitido (cache hit; STAGE2_PIXEL_H5_PROFILE_ON_TRAIN=False)")
+            print("[Stage2-Pixel] Perfil HDF5 omitido — cache OK, iniciando entrenamiento...", flush=True)
+        log.info("[Stage2-Pixel] Paso 2/2: entrenamiento ViT (lectura HDF5)")
+
+    train_config = {
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "val_fraction": val_fraction,
+        "gate_run_id": gate_run_id,
+        "use_amp": use_amp,
+        "input_size": input_size,
+        "vit_name": vit_name,
+        "freeze_backbone": freeze_bb,
+        "full": full,
+        "lr": float(_cfg("STAGE2_PIXEL_LR", 1e-4)),
+        "backbone_lr_factor": float(_cfg("STAGE2_PIXEL_BACKBONE_LR_FACTOR", 0.1)),
+        "split_info": split_info,
+    }
+    if not resume:
+        write_pretrain_setup(
+            layout,
+            split_info=split_info,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            h5_meta=h5_meta,
+            train_config=train_config,
+        )
+
+    model = build_pixel_morph_vit(
+        backbone_name=vit_name,
+        freeze_backbone=freeze_bb,
+        decoder_type=str(_cfg("STAGE2_PIXEL_DECODER_TYPE", "multiscale")),
+        unfreeze_last_n=int(_cfg("STAGE2_PIXEL_UNFREEZE_LAST_N", 2)),
+    )
+    ckpt_dir = paths.root / "models" / "checkpoints" / "stage2_am"
+
+    from .phase_e_stage2 import count_parameters
+
+    max_train = None if full else 40
+    max_val = None if full else 15
+
+    start_epoch = 1
+    initial_history: Optional[PixelTrainHistory] = None
+    if resume:
+        latest = find_latest_epoch_checkpoint(layout)
+        if latest is None:
+            raise FileNotFoundError(
+                f"No hay checkpoint en {layout.pretrain_checkpoints} para --resume"
+            )
+        last_ep, ckpt_path = latest
+        if last_ep >= epochs:
+            log.warning(
+                f"[Stage2-Pixel] Ya completadas {last_ep}/{epochs} épocas — finalizando posttrain/"
+            )
+            recover_stage2_pixel_run(layout.run_root, global_ckpt_dir=ckpt_dir, force=True)
+            return
+        load_resume_checkpoint(ckpt_path, model, device)
+        try:
+            state = load_training_state(layout)
+            initial_history = PixelTrainHistory.from_dict(state["history"])
+            start_epoch = int(state.get("epoch", last_ep)) + 1
+        except FileNotFoundError:
+            initial_history = PixelTrainHistory()
+            start_epoch = last_ep + 1
+        log.info(f"[Stage2-Pixel] Resume ep {start_epoch}/{epochs} desde {ckpt_path.name}")
+
+    log.info(
+        f"[Stage2-Pixel ViT] Fase E — train={len(train_df)} val={len(val_df)} "
+        f"test={len(test_df)} epochs={epochs} run={run.run_id}"
+    )
+    history: Optional[PixelTrainHistory] = None
+    training_ok = False
+    watchdog_proc = None
+    import atexit
+    import os
+    import signal
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from .phase_e_stage2.stage2_pixel_train_report import (
+        terminal_alarm,
+        write_train_heartbeat,
+        write_train_warning,
+    )
+
+    def _spawn_watchdog() -> Optional[subprocess.Popen]:
+        """Proceso externo: detecta kill/TDR/freeze (muerte silenciosa)."""
+        try:
+            wd = _Path(__file__).resolve().parents[2] / "tools" / "stage2_pixel_train_watchdog.py"
+            py = sys.executable
+            cmd = [
+                str(py),
+                str(wd),
+                "--run-id",
+                run.run_id,
+                "--train-pid",
+                str(os.getpid()),
+                "--stale-sec",
+                "180",
+                "--interval",
+                "15",
+            ]
+            log_path = layout.pretrain / "watchdog.log"
+            layout.pretrain.mkdir(parents=True, exist_ok=True)
+            logf = open(log_path, "a", encoding="utf-8")
+            logf.write(f"\n=== watchdog spawn {datetime.now().isoformat()} pid_train={os.getpid()} ===\n")
+            logf.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(_Path(__file__).resolve().parents[2]),
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+            phase_msg = (
+                f"WATCHDOG lanzado pid={proc.pid} (log -> {log_path}). "
+                "Detecta proceso muerto / heartbeat stale y ALARMA en terminal."
+            )
+            print(f"[Stage2-Pixel] {phase_msg}", flush=True)
+            log.info(phase_msg)
+            write_train_heartbeat(
+                layout.pretrain,
+                phase="watchdog_spawned",
+                run_id=run.run_id,
+                epoch=start_epoch - 1,
+                epochs_total=epochs,
+                watchdog_pid=proc.pid,
+            )
+            return proc
+        except Exception as exc:
+            write_train_warning(
+                layout.pretrain,
+                "WATCHDOG_SPAWN_FAILED",
+                str(exc),
+                level="error",
+                alarm=True,
+            )
+            return None
+
+    def _alarm_on_signal(signum, frame):  # noqa: ARG001
+        name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        write_train_warning(
+            layout.pretrain,
+            "TRAIN_SIGNAL",
+            f"Señal recibida: {name} (signum={signum}). Entrenamiento abortado.",
+            level="error",
+            alarm=True,
+            signum=signum,
+        )
+
+    for _sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):
+        if _sig is None:
+            continue
+        try:
+            signal.signal(_sig, _alarm_on_signal)
+        except Exception:
+            pass
+
+    watchdog_proc = _spawn_watchdog()
+
+    def _stop_watchdog() -> None:
+        nonlocal watchdog_proc
+        if watchdog_proc is None:
+            return
+        try:
+            if watchdog_proc.poll() is None:
+                watchdog_proc.terminate()
+        except Exception:
+            pass
+        watchdog_proc = None
+
+    atexit.register(_stop_watchdog)
+
+    try:
+        history = train_pixel_morph_gpu(
+            model,
+            train_df,
+            val_df,
+            device=device,
+            epochs=epochs,
+            batch_size=batch_size,
+            input_size=input_size,
+            input_mode="vit",
+            morph_params=morph,
+            checkpoint_dir=ckpt_dir,
+            checkpoint_name="stage2_pixel_vit_best",
+            use_amp=use_amp,
+            max_train_batches=max_train,
+            max_val_batches=max_val,
+            lr=float(_cfg("STAGE2_PIXEL_LR", 1e-4)),
+            backbone_lr_factor=float(_cfg("STAGE2_PIXEL_BACKBONE_LR_FACTOR", 0.1)),
+            metrics_run_dir=layout.pretrain,
+            run_id=run.run_id,
+            n_params=count_parameters(model),
+            h5_store=h5_store,
+            layout=layout,
+            start_epoch=start_epoch,
+            initial_history=initial_history,
+            loss_type=str(_cfg("STAGE2_PIXEL_LOSS_TYPE", "focal")),
+            focal_gamma=float(_cfg("STAGE2_PIXEL_FOCAL_GAMMA", 2.0)),
+            class_weight_mode=str(_cfg("STAGE2_PIXEL_CLASS_WEIGHTS", "inv_freq")),
+            aux_entropy_loss=bool(_cfg("STAGE2_PIXEL_AUX_ENTROPY_LOSS", True)),
+            aux_entropy_weight=float(_cfg("STAGE2_PIXEL_AUX_ENTROPY_WEIGHT", 0.1)),
+            prior_loss_enabled=bool(_cfg("STAGE2_PIXEL_PRIOR_LOSS_ENABLED", True)),
+            prior_loss_weights=PriorLossWeights(
+                ih=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_IH_WEIGHT", 0.05)),
+                v=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_V_WEIGHT", 0.05)),
+                prec=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_PREC_WEIGHT", 0.02)),
+                a=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_A_WEIGHT", 0.0)),
+            ),
+            morph_params_for_prior=morph,
+            prior_loss_workers=int(_cfg("STAGE2_PIXEL_PRIOR_LOSS_WORKERS", 4)),
+            ms_loss_enabled=bool(_cfg("STAGE2_PIXEL_MS_LOSS_ENABLED", True)),
+            ms_loss_weight=float(_cfg("STAGE2_PIXEL_MS_WEIGHT", 0.5)),
+            ms_slices=int(_cfg("STAGE2_PIXEL_MS_SLICES", 4)),
+            ms_k_per_class=int(_cfg("STAGE2_PIXEL_MS_K_PER_CLASS", 256)),
+            ms_alpha=float(_cfg("STAGE2_PIXEL_MS_ALPHA", 2.0)),
+            ms_beta=float(_cfg("STAGE2_PIXEL_MS_BETA", 50.0)),
+            ms_base=float(_cfg("STAGE2_PIXEL_MS_BASE", 0.5)),
+        )
+        training_ok = True
+    except Exception as exc:
+        write_train_warning(
+            layout.pretrain,
+            "TRAIN_ABORTED",
+            str(exc),
+            level="error",
+            alarm=True,
+            exc_type=type(exc).__name__,
+        )
+        terminal_alarm("TRAIN_ABORTED", f"{type(exc).__name__}: {exc}")
+        log.error(f"[Stage2-Pixel] Entrenamiento interrumpido: {exc}")
+        if not is_posttrain_complete(layout):
+            try:
+                recover_stage2_pixel_run(layout.run_root, global_ckpt_dir=ckpt_dir, force=True)
+                log.info("[Stage2-Pixel] posttrain/ reconstruido desde artefactos parciales")
+            except Exception as rec_exc:
+                log.error(f"[Stage2-Pixel] Recovery parcial falló: {rec_exc}")
+        raise
+    finally:
+        if h5_store is not None:
+            h5_store.close()
+        _stop_watchdog()
+
+    if history is None:
+        return
+
+    meta = build_run_meta(
+        layout,
+        history=history.to_dict(),
+        gate_run_id=gate_run_id,
+        vit_name=vit_name,
+        epochs=epochs,
+        input_size=input_size,
+        split_info=split_info,
+        n_test_tiles=int(len(test_df)),
+        checkpoint_path=ckpt_dir / "stage2_pixel_vit_best.pt",
+        h5_meta=h5_meta,
+        interrupted=not training_ok or len(history.epochs) < epochs,
+    )
+    write_training_profile(layout, history.to_dict())
+    finalize_posttrain(
+        layout,
+        history=history.to_dict(),
+        meta=meta,
+        checkpoint_src=ckpt_dir / "stage2_pixel_vit_best.pt",
+        write_plots=True,
+    )
+    if bool(_cfg("STAGE2_PIXEL_POSTTRAIN_FULL_REPORT", True)):
+        log.info("[Stage2-Pixel] Paso 3/3: informe posttrain (holdout HDF5 + gráficos + atención/priors)")
+        print(
+            "[Stage2-Pixel] Paso 3/3: informe posttrain (val/test desde HDF5, sin re-inferir gate)...",
+            flush=True,
+        )
+        try:
+            from .phase_e_stage2.stage2_pixel_posttrain_report import generate_stage2_pixel_posttrain_report
+
+            report_dir = generate_stage2_pixel_posttrain_report(
+                layout.run_root,
+                force=True,
+                skip_fullimage=bool(_cfg("STAGE2_PIXEL_POSTTRAIN_SKIP_FULLIMAGE", False)),
+                max_fullimage_val=int(_cfg("STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_VAL", 6)),
+                max_fullimage_test=int(_cfg("STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_TEST", 6)),
+                with_explain_panels=bool(_cfg("STAGE2_PIXEL_POSTTRAIN_EXPLAIN_PANELS", True)),
+                attention_layers=str(_cfg("STAGE2_PIXEL_EXPLAIN_ATTENTION_LAYERS", "last")),
+                gate_strict=bool(_cfg("STAGE2_GATE_INFERENCE_STRICT", True)),
+                require_gate_cache=bool(_cfg("STAGE2_POSTTRAIN_REQUIRE_GATE_CACHE", True)),
+            )
+            log.info(f"[Stage2-Pixel] Informe posttrain -> {report_dir}")
+            print(f"[Stage2-Pixel] Informe posttrain OK -> {report_dir}", flush=True)
+        except Exception as rep_exc:
+            log.error(f"[Stage2-Pixel] Informe posttrain falló (train OK): {rep_exc}")
+            print(f"[Stage2-Pixel] AVISO: informe posttrain falló: {rep_exc}", flush=True)
+    # Flag para que el watchdog salga limpio (cubre muerte silenciosa ≠ fin OK)
+    try:
+        (layout.pretrain / "TRAIN_COMPLETE.flag").write_text(
+            f"ok best_mIoU={history.best_val_miou:.4f} ep={history.best_epoch}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    log.info(
+        f"[Stage2-Pixel ViT] [bold green]OK[/bold green] "
+        f"best_mIoU={history.best_val_miou:.4f} ep={history.best_epoch}"
+    )
+
+
+@app.command(name="recover-stage2-pixel-run")
+def recover_stage2_pixel_run_cmd(
+    run_id: str = typer.Option(..., "--run-id", help="ID corrida en outputs/"),
+    force: bool = typer.Option(False, "--force", help="Regenerar posttrain/ aunque exista"),
+    with_report: bool = typer.Option(True, "--with-report/--no-report", help="Generar informe posttrain completo"),
+):
+    """Reconstruye posttrain/ desde pretrain/ + checkpoints (sin re-entrenar)."""
+    from .phase_e_stage2.stage2_pixel_run_layout import recover_stage2_pixel_run
+
+    paths = get_paths()
+    ckpt_dir = paths.root / "models" / "checkpoints" / "stage2_am"
+    post = recover_stage2_pixel_run(run_id, global_ckpt_dir=ckpt_dir, force=force)
+    log.info(f"[Stage2-Pixel] Recovery [bold green]OK[/bold green] -> {post}")
+    if with_report:
+        from .phase_e_stage2.stage2_pixel_posttrain_report import generate_stage2_pixel_posttrain_report
+
+        report = generate_stage2_pixel_posttrain_report(post.parent, force=True)
+        log.info(f"[Stage2-Pixel] Informe posttrain -> {report}")
+
+
+@app.command(name="stage2-pixel-posttrain-report")
+def stage2_pixel_posttrain_report_cmd(
+    run_id: str = typer.Option(..., "--run-id", help="ID corrida en outputs/"),
+    force: bool = typer.Option(False, "--force", help="Regenerar aunque exista SUMMARY.md"),
+    skip_fullimage: bool = typer.Option(
+        None,
+        "--skip-fullimage/--fullimage",
+        help="Omitir mapas full-image (re-infiere gate, lento). Default: config STAGE2_PIXEL_POSTTRAIN_SKIP_FULLIMAGE",
+    ),
+    max_fullimage_val: int = typer.Option(
+        None, help="Imágenes val full-image (default: config STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_VAL=6)"
+    ),
+    max_fullimage_test: int = typer.Option(
+        None, help="Imágenes test full-image (default: config STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_TEST=6)"
+    ),
+):
+    """Genera informe posttrain completo: report MD, tablas holdout, overlays y curvas."""
+    from .phase_e_stage2.stage2_pixel_posttrain_report import generate_stage2_pixel_posttrain_report
+
+    paths = get_paths()
+    run_root = paths.outputs / run_id
+    if not run_root.is_dir():
+        run_root = Path(run_id)
+    report = generate_stage2_pixel_posttrain_report(
+        run_root,
+        force=force,
+        skip_fullimage=bool(_cfg("STAGE2_PIXEL_POSTTRAIN_SKIP_FULLIMAGE", False))
+        if skip_fullimage is None
+        else skip_fullimage,
+        max_fullimage_val=int(_cfg("STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_VAL", 6))
+        if max_fullimage_val is None
+        else max_fullimage_val,
+        max_fullimage_test=int(_cfg("STAGE2_PIXEL_POSTTRAIN_MAX_FULLIMAGE_TEST", 6))
+        if max_fullimage_test is None
+        else max_fullimage_test,
+        with_explain_panels=bool(_cfg("STAGE2_PIXEL_POSTTRAIN_EXPLAIN_PANELS", True)),
+        attention_layers=str(_cfg("STAGE2_PIXEL_EXPLAIN_ATTENTION_LAYERS", "last")),
+        gate_strict=bool(_cfg("STAGE2_GATE_INFERENCE_STRICT", True)),
+        require_gate_cache=bool(_cfg("STAGE2_POSTTRAIN_REQUIRE_GATE_CACHE", True)),
+    )
+    log.info(f"[Stage2-Pixel] Informe posttrain [bold green]OK[/bold green] -> {report}")
 
 
 @app.command(name="infer-stage2")
@@ -1328,15 +1961,16 @@ def infer_stage2_cmd(
     backbone: Optional[str] = typer.Option(None, help="Backbone Branch A (si se omite usa config.py::DEFAULT_BACKBONE)"),
     tau_s1: Optional[float] = typer.Option(None, help="Umbral gate Stage1 (si se omite usa config.py::DEFAULT_TAU_S1)"),
     batch_size: Optional[int] = typer.Option(None, help="Batch size (si se omite usa config.py::DEFAULT_BATCH_SIZE)"),
+    pixel_morph: Optional[bool] = typer.Option(None, help="Mapas morfológicos píxel IH/A/V/H"),
 ):
-    """Fase E — Stage1 gate + Stage2 subclases en M+ + capas L4/L7/L8."""
+    """Fase E — Stage1 gate + Stage2 subclases en M+ + mapas píxel morfológicos L9."""
     import json
     import torch
 
     from .common.io import write_table
     from .layers import LayerContext, compose, downscale_context, save_png, render_layer
     from .phase_b_tiling.gpu_io import decode_jpeg_gpu
-    from .phase_d_stage1 import infer_image_gate_gpu, load_gate_am_ensemble
+    from .phase_d_stage1.gate_tile_dino import infer_image_gate_probe_gpu, load_gate_probe_bundle
     from .phase_d_stage1.segmentation_map import build_segmentation_map_mplus
     from .phase_e_stage2 import (
         StageTwoEnsembleGPU,
@@ -1353,24 +1987,30 @@ def infer_stage2_cmd(
     image = image or _cfg_path("DEFAULT_IMAGE")
     if image is None:
         raise typer.BadParameter("Debes indicar --image o definir DEFAULT_IMAGE en config.py")
-    lineage = str(lineage or _cfg("DEFAULT_LINEAGE", "AM")).upper()
-    backbone = backbone or str(_cfg("DEFAULT_BACKBONE", "dinov2_vits14"))
-    tau_s1 = float(tau_s1 if tau_s1 is not None else _cfg("DEFAULT_TAU_S1", 0.65))
-    batch_size = int(batch_size if batch_size is not None else _cfg("DEFAULT_BATCH_SIZE", 32))
+    lineage = str(lineage or _cfg("STAGE2_LINEAGE_DEFAULT", "AM")).upper()
+    backbone = backbone or str(_cfg("STAGE2_BACKBONE", "dinov2_vits14"))
+    tau_s1 = float(
+        tau_s1 if tau_s1 is not None else _cfg("STAGE2_TAU_GATE_MPLUS", _cfg("DEFAULT_TAU_S1", 0.65))
+    )
+    batch_size = int(batch_size if batch_size is not None else _cfg("STAGE2_BATCH_SIZE", 16))
 
     paths = get_paths()
-    run = RunOutputs.create("stage2_infer", suffix=f"{lineage}__{image.stem}")
+    gate_run_id = str(_cfg("STAGE2_GATE_RUN_ID", ""))
+    run = RunOutputs.create(
+        "stage2_infer",
+        suffix=f"{lineage}__gate{gate_run_id}__{image.stem}" if gate_run_id else f"{lineage}__{image.stem}",
+    )
     device = torch.device("cuda")
     ckpt_s2 = paths.root / "models" / "checkpoints" / f"stage2_{lineage.lower()}"
     weights_dir = paths.root / "models" / "weights"
 
     try:
-        ens1 = load_gate_am_ensemble(backbone=backbone, device=device)
-    except FileNotFoundError as e:
+        gate_bundle = load_gate_probe_bundle(device=device, gate_run_id=gate_run_id)
+    except (FileNotFoundError, RuntimeError) as e:
         log.error(str(e))
         raise typer.Exit(code=1) from e
 
-    s1_df = infer_image_gate_gpu(image, ens1, batch_size=batch_size)
+    s1_df = infer_image_gate_probe_gpu(image, gate_bundle, batch_size=batch_size)
     if s1_df.empty:
         log.warning("Sin tiles para esta imagen.")
         return
@@ -1378,28 +2018,186 @@ def infer_stage2_cmd(
     # Stage2 subclases
     class_map = load_stage2_class_map(lineage)
     n_cls = class_map.num_classes
+    skip_b = bool(_cfg("STAGE2_SKIP_B", True))
+    skip_c = bool(_cfg("STAGE2_SKIP_C", True))
+
     a2 = build_branch_a_mc(n_cls, backbone_name=backbone)
-    b2 = build_branch_b_mc(n_cls, weights_path=weights_dir / "u2netp.pth")
-    c2 = build_branch_c_mc(n_cls)
+    b2 = build_branch_b_mc(n_cls, weights_path=weights_dir / "u2netp.pth") if not skip_b else None
+    c2 = build_branch_c_mc(n_cls) if not skip_c else None
 
     def _load_s2(model, name):
+        if model is None:
+            return
         p = ckpt_s2 / f"stage2_{lineage.lower()}_branch_{name.lower()}_best.pt"
         if p.exists():
             st = torch.load(p, map_location="cpu", weights_only=False)
             model.load_state_dict(st["model_state_dict"])
             log.info(f"[Stage2 {name}] checkpoint F1={st.get('f1_macro', 0):.4f}")
         else:
-            log.warning(f"[Stage2 {name}] sin checkpoint en {p}")
+            raise FileNotFoundError(f"[Stage2 {name}] sin checkpoint en {p}")
 
-    _load_s2(a2, "A"); _load_s2(b2, "B"); _load_s2(c2, "C")
+    _load_s2(a2, "A")
+    if b2 is not None:
+        _load_s2(b2, "B")
+    if c2 is not None:
+        _load_s2(c2, "C")
 
     ens2 = StageTwoEnsembleGPU(
-        branch_a=a2, branch_b=b2, branch_c=c2, class_map=class_map,
+        branch_a=a2,
+        branch_b=b2 if b2 is not None else a2,
+        branch_c=c2 if c2 is not None else a2,
+        class_map=class_map,
+        weights={"A": 1.0, "B": 0.0, "C": 0.0} if skip_b and skip_c else None,
     ).to(device)
 
     df = infer_image_stage2_gpu(image, ens2, s1_df, batch_size=batch_size)
     csv = write_table(df, run.tables / f"{image.stem}__stage2_probs")
     log.info(f"[Fase E] Probs Stage2 -> {csv}")
+
+    do_pixel = bool(_cfg("STAGE2_PIXEL_ENABLED", True)) if pixel_morph is None else pixel_morph
+    pixel_quant_img: dict = {}
+    if do_pixel:
+        import numpy as np
+
+        from .phase_e_stage2.infer_pixel_gpu import (
+            PixelMorphInferResult,
+            build_tile_explain_bundles,
+            infer_image_pixel_morph,
+        )
+        from .phase_e_stage2.pixel_explainability import (
+            explain_quant_table,
+            export_tile_explain_maps,
+            image_explain_summary,
+            render_scalar_heatmap,
+            stitch_float_map_from_tiles,
+            write_explicabilidad_pixel_md,
+        )
+        from .phase_e_stage2.pixel_morph import (
+            PixelMorphParams,
+            render_colony_binary,
+            render_confidence_heatmap,
+            render_diagnostic_overlay,
+            render_pixel_class_map,
+            render_smoothness_heatmap,
+        )
+        from .phase_e_stage2.pixel_vit_model import build_pixel_morph_vit
+        from .phase_i_weakseg.pipeline import WeakSegParams
+
+        backend = str(_cfg("STAGE2_PIXEL_BACKEND", "vit"))
+        vit_name = str(_cfg("STAGE2_PIXEL_VIT_MODEL", "dinov2_vits14"))
+        input_size = int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224))
+        morph = PixelMorphParams(
+            weak=WeakSegParams(
+                vesicle_circularity_min=float(_cfg("STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN", 0.85)),
+                frangi_pctl=float(_cfg("STAGE2_PIXEL_FRANGI_PCTL", 82.0)),
+                arbuscule_pctl=float(_cfg("STAGE2_PIXEL_ARBUSCULE_PCTL", 93.0)),
+            ),
+            seam_sigma=0.0,
+        )
+        pixel_model = None
+        ckpt_pixel = paths.root / "models" / "checkpoints" / "stage2_am" / "stage2_pixel_vit_best.pt"
+        if backend in ("vit", "ensemble") and ckpt_pixel.exists():
+            pixel_model = build_pixel_morph_vit(
+                backbone_name=vit_name,
+                freeze_backbone=True,
+                decoder_type=str(_cfg("STAGE2_PIXEL_DECODER_TYPE", "multiscale")),
+            )
+            st = torch.load(ckpt_pixel, map_location="cpu", weights_only=False)
+            pixel_model.load_state_dict(st["model_state_dict"])
+            pixel_model.to(device).eval()
+            log.info(f"[Fase E Pixel ViT] checkpoint miou={st.get('val_miou', 0):.4f} backend={backend}")
+        elif backend != "weak":
+            log.warning("[Fase E Pixel ViT] sin checkpoint; fallback weak")
+            backend = "weak"
+
+        explain_on = bool(_cfg("STAGE2_PIXEL_EXPLAIN_ENABLED", True))
+        attn_layers = str(_cfg("STAGE2_PIXEL_EXPLAIN_ATTENTION_LAYERS", "last"))
+        infer_out = infer_image_pixel_morph(
+            image,
+            s1_df,
+            backend=backend,  # type: ignore
+            model=pixel_model,
+            device=device,
+            morph_params=morph,
+            input_size=input_size,
+            with_explain=explain_on,
+            attention_layers=attn_layers,
+        )
+        if explain_on and isinstance(infer_out, PixelMorphInferResult):
+            full_seg = infer_out.seg_map
+            tile_table = infer_out.tile_table
+            tile_segments = infer_out.tile_segments
+        else:
+            full_seg, tile_table, tile_segments = infer_out  # type: ignore[misc]
+        if not tile_table.empty:
+            write_table(tile_table, run.tables / f"{image.stem}__pixel_morph_quant")
+        npz_payload: dict = {"seg_map": full_seg}
+        if explain_on and isinstance(infer_out, PixelMorphInferResult) and infer_out.tile_probs:
+            # Guardar probs del tile central (más grande) como muestra compacta
+            if infer_out.tile_probs:
+                k0 = next(iter(infer_out.tile_probs))
+                npz_payload["sample_probs"] = infer_out.tile_probs[k0]
+        np.savez_compressed(run.tables / f"{image.stem}__pixel_seg.npz", **npz_payload)
+        gimg_px = decode_jpeg_gpu(image, device=device)
+        img_px = gimg_px.tensor.permute(1, 2, 0).contiguous().cpu().numpy()
+        del gimg_px
+        l9_classes = render_pixel_class_map(full_seg)
+        l9_colony = render_colony_binary(full_seg)
+        l9_conf = render_smoothness_heatmap(full_seg)
+        l9_diag = render_diagnostic_overlay(img_px, full_seg, alpha=0.48)
+        save_png(l9_classes, run.maps / f"{image.stem}__L9_morph_classes.png")
+        save_png(l9_colony, run.maps / f"{image.stem}__L9_colony_binary.png")
+        save_png(l9_conf, run.maps / f"{image.stem}__L9_smoothness.png")
+        save_png(l9_conf, run.maps / f"{image.stem}__L9_confidence.png")
+        save_png(l9_diag, run.maps / f"{image.stem}__L9_diagnostico.png")
+        save_png(l9_diag, run.maps / f"{image.stem}__09_L9_morph_diagnostico.png")
+
+        if explain_on and isinstance(infer_out, PixelMorphInferResult):
+            bundles = build_tile_explain_bundles(infer_out)
+            explain_df = explain_quant_table(s1_df, bundles, tile_table)
+            if not explain_df.empty:
+                write_table(explain_df, run.tables / f"{image.stem}__pixel_explain_quant")
+            summary = image_explain_summary(explain_df)
+            write_explicabilidad_pixel_md(
+                run=run,
+                image_stem=image.stem,
+                explain_df=explain_df,
+                summary=summary,
+            )
+            if bundles:
+                rep_key = next(iter(bundles))
+                rep = bundles[rep_key]
+                export_tile_explain_maps(
+                    image.stem,
+                    run.maps,
+                    rep,
+                    export_probs=bool(_cfg("STAGE2_PIXEL_EXPLAIN_EXPORT_PROBS", True)),
+                    export_priors=bool(_cfg("STAGE2_PIXEL_EXPLAIN_EXPORT_PRIORS", True)),
+                )
+                if infer_out.tile_priors:
+                    frangi_tiles = {k: v.frangi for k, v in infer_out.tile_priors.items()}
+                    frangi_full = stitch_float_map_from_tiles(full_seg.shape, s1_df, frangi_tiles)
+                    save_png(
+                        render_scalar_heatmap(frangi_full),
+                        run.maps / f"{image.stem}__L9_prior_frangi_full.png",
+                    )
+                if infer_out.tile_probs and infer_out.tile_weak:
+                    disagree_tiles = {
+                        k: (infer_out.tile_segments[k] != infer_out.tile_weak[k]).astype(np.float32)
+                        for k in infer_out.tile_segments
+                        if k in infer_out.tile_weak
+                    }
+                    disagree_full = stitch_float_map_from_tiles(full_seg.shape, s1_df, disagree_tiles)
+                    disp_rgb = np.zeros((*full_seg.shape, 3), dtype=np.uint8)
+                    disp_rgb[disagree_full > 0.5] = (255, 60, 60)
+                    save_png(disp_rgb, run.maps / f"{image.stem}__L9_disagreement.png")
+        from .phase_e_stage2.pixel_morph import quantize_segment
+
+        pixel_quant_img = quantize_segment(full_seg)
+        log.info(
+            f"[Fase E Pixel] colonized={pixel_quant_img.get('pct_colonized', 0):.1f}% "
+            f"IH={pixel_quant_img.get('pct_IH', 0):.1f}% A={pixel_quant_img.get('pct_A', 0):.1f}%"
+        )
 
     ts = _infer_tile_size_from_manifest(image, fallback=252)
     gimg = decode_jpeg_gpu(image, device=device)
@@ -1412,22 +2210,28 @@ def infer_stage2_cmd(
     df_l2 = df.copy()
     if "stage1_pred" in df_l2.columns:
         df_l2["stage1"] = df_l2["stage1_pred"].astype(str)
+    if "p_fused" not in df_l2.columns and "p_mplus" in df_l2.columns:
+        df_l2["p_fused"] = df_l2["p_mplus"]
+    if "consensus" not in df_l2.columns and "stage2_consensus" in df_l2.columns:
+        df_l2["consensus"] = df_l2["stage2_consensus"]
 
     ctx = LayerContext(image=img_np, tile_size=ts, tiles=df_l2)
-    seg_prob, seg_bin = build_segmentation_map_mplus(
-        image_path=image,
-        tiles_df=df_l2,
-        seg_branch_model=ens1.branch_b,
-        batch_size=batch_size,
-        device=device,
-        threshold=0.5,
-    )
-    np.savez_compressed(
-        run.tables / f"{image.stem}__stage2_segmentation_l4.npz",
-        seg_prob=seg_prob,
-        seg_bin=seg_bin,
-    )
-    ctx.seg_mask = seg_prob
+    seg_bin = None
+    if not skip_b and b2 is not None:
+        seg_prob, seg_bin = build_segmentation_map_mplus(
+            image_path=image,
+            tiles_df=df_l2,
+            seg_branch_model=b2,
+            batch_size=batch_size,
+            device=device,
+            threshold=0.5,
+        )
+        np.savez_compressed(
+            run.tables / f"{image.stem}__stage2_segmentation_l4.npz",
+            seg_prob=seg_prob,
+            seg_bin=seg_bin,
+        )
+        ctx.seg_mask = seg_prob
     ctx = downscale_context(ctx, 4)
 
     l0 = render_layer("L0", ctx)
@@ -1446,7 +2250,16 @@ def infer_stage2_cmd(
     if "stage2_entropy" in df.columns and df["stage2_entropy"].notna().any():
         ov_l0_l4_l7_l8 = compose(["L0", "L4", "L7", "L8"], ctx, alphas=[1.0, 0.5, 0.45, 0.35])
         save_png(ov_l0_l4_l7_l8, run.maps / f"{image.stem}__L0_L4_L7_L8.png")
-        ov_diag = compose(["L0", "L3", "L4", "L6", "L7", "L8"], ctx, alphas=[1.0, 0.25, 0.45, 0.25, 0.4, 0.35])
+        diag_layers = ["L0", "L4", "L7", "L8"]
+        diag_alphas = [1.0, 0.45, 0.4, 0.35]
+        if "p_fused" in df_l2.columns:
+            diag_layers.insert(1, "L3")
+            diag_alphas.insert(1, 0.25)
+        if "consensus" in df_l2.columns:
+            idx = diag_layers.index("L7") if "L7" in diag_layers else len(diag_layers)
+            diag_layers.insert(idx, "L6")
+            diag_alphas.insert(idx, 0.25)
+        ov_diag = compose(diag_layers, ctx, alphas=diag_alphas)
         save_png(
             ov_diag, run.maps / f"{image.stem}__diagnostico_stage2.png",
         )
@@ -1503,7 +2316,7 @@ def infer_stage2_cmd(
     )
 
     n_s2 = int(df["stage2_pred"].notna().sum()) if "stage2_pred" in df.columns else 0
-    seg_cov = float((seg_bin > 0.5).mean() * 100.0)
+    seg_cov = float((seg_bin > 0.5).mean() * 100.0) if seg_bin is not None else 0.0
     stage2_counts = {}
     if "stage2_pred" in df.columns:
         stage2_counts = {str(k): int(v) for k, v in df["stage2_pred"].dropna().value_counts().to_dict().items()}

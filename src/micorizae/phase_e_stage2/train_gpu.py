@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from tqdm.auto import tqdm
 
 from ..common.logging_utils import get_logger
@@ -94,11 +94,21 @@ def evaluate_branch_gpu_s2(
     pred = np.concatenate(all_pred) if all_pred else np.array([])
     labels = np.concatenate(all_labels) if all_labels else np.array([])
     if len(labels) == 0:
-        return {"loss": 0.0, "acc": 0.0, "f1_macro": 0.0}
+        return {"loss": 0.0, "acc": 0.0, "f1_macro": 0.0, "per_class_recall": {}}
+    per_class = classification_report(
+        labels, pred, labels=list(range(class_map.num_classes)),
+        target_names=list(class_map.classes), output_dict=True, zero_division=0,
+    )
+    recalls = {
+        name: float(per_class.get(name, {}).get("recall", 0.0))
+        for name in class_map.classes
+    }
     return {
         "loss": total_loss / max(n, 1),
         "acc": float(accuracy_score(labels, pred)),
         "f1_macro": float(f1_score(labels, pred, average="macro", zero_division=0)),
+        "per_class_recall": recalls,
+        "classification_report": per_class,
     }
 
 
@@ -121,6 +131,8 @@ def train_branch_gpu_s2(
     max_train_batches: Optional[int] = None,
     max_val_batches: Optional[int] = None,
     grad_clip: float = 5.0,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
 ) -> GPUTrainHistoryS2:
     checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
     if checkpoint_dir:
@@ -128,7 +140,12 @@ def train_branch_gpu_s2(
 
     model.to(device)
     class_w = _class_weights(train_df, class_map, device)
-    loss_fn = nn.CrossEntropyLoss(weight=class_w)
+    if loss_type == "focal":
+        from ..phase_d_stage1.losses import FocalLossCE
+
+        loss_fn = FocalLossCE(gamma=focal_gamma, weight=class_w)
+    else:
+        loss_fn = nn.CrossEntropyLoss(weight=class_w)
 
     backbone_params, head_params = [], []
     for name, p in model.named_parameters():
@@ -209,8 +226,12 @@ def train_branch_gpu_s2(
                         "model_state_dict": best_state,
                         "epoch": ep,
                         "f1_macro": val["f1_macro"],
+                        "acc": val["acc"],
+                        "per_class_recall": val.get("per_class_recall", {}),
                         "classes": list(class_map.classes),
                         "lineage": class_map.lineage,
+                        "branch": branch,
+                        "loss_type": loss_type,
                     },
                     checkpoint_dir / f"{branch_name}_best.pt",
                 )

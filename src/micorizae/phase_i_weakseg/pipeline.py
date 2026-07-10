@@ -115,6 +115,33 @@ class WeakSegParams:
     root_min_cov: float = 0.02
     root_max_cov: float = 0.70
     min_patch_fg_ratio: float = 0.002
+    # --- Detector stain-aware (color deconvolution + estructura) ---
+    stain_aware: bool = True
+    stain_bg_maxc: int = 232          # canal max > umbral ⇒ fondo blanco
+    stain_bg_sat: float = 0.10        # saturación mínima para considerar tejido
+    stain_pctl: float = 60.0          # percentil de densidad para "hay tinción" (colonización)
+    ves_min_sigma: float = 2.0        # LoG blob vesículas (px)
+    ves_max_sigma: float = 16.0
+    ves_blob_thr: float = 0.035       # umbral respuesta LoG normalizada
+    ves_solidity_min: float = 0.82    # convexidad mínima del blob
+    ves_roundness_min: float = 0.55   # 4πA/P² mínimo
+    ves_stain_z: float = 0.45         # blob más oscuro/azul que su entorno (z-score global, secundario)
+    ves_contrast_min: float = 0.06    # contraste local disco vs anillo (OD) — mata falsos en azul uniforme
+    ves_bg_max: float = 0.50          # densidad máx del anillo — vesícula = punto oscuro sobre tejido claro
+    arb_fine_pctl: float = 88.0       # textura fina alta (energía alta-frecuencia)
+    arb_density_pctl: float = 80.0    # densidad de tinción alta
+    arb_min_area: int = 40            # área mínima de arbúsculo (px)
+    ves_max_radius: int = 30          # radio máximo de vesícula (px) — evita "blobs" gigantes
+    ih_frangi_sigmas: tuple = (1.0, 2.0, 3.0, 4.0)
+    ih_tophat_disk: int = 9           # top-hat prominencia de cresta (hifa fina)
+    ih_prom_pctl: float = 65.0        # percentil de prominencia (piso relativo)
+    ih_tophat_abs: float = 0.055      # piso ABSOLUTO de prominencia — mata speckle en azul uniforme
+    ih_min_area: int = 18             # elimina fragmentos IH diminutos (px)
+    # --- Ambigüedad / ignore: azul saturado en área grande (estructura no resoluble) ---
+    amb_density: float = 0.60         # OD alto = tinción intensa
+    amb_blueness: float = 0.60        # azuleza alta
+    amb_win: int = 48                 # ventana px para fracción local saturada
+    amb_frac: float = 0.55            # fracción saturada en la ventana ⇒ región grande no resoluble
 
 
 def _load_image_rgb(image_path: Path) -> np.ndarray:
@@ -416,7 +443,214 @@ def _tile_arbuscule_mask(gray: np.ndarray, root_mask: np.ndarray, p: WeakSegPara
     return (ent >= thr) & root_mask
 
 
+def _stain_maps(tile_rgb: np.ndarray) -> dict[str, np.ndarray]:
+    """Separa señal de tinción (azul de tripano) del tejido y el fondo.
+
+    Fundamento: en tinción azul, el colorante fúngico absorbe fuertemente la luz
+    roja (densidad óptica de rojo alta) y es más azul que el tejido pálido
+    (Ruifrok & Johnston 2001, color deconvolution). El fondo es blanco (R,G,B altos,
+    baja saturación).
+
+    Devuelve:
+      density  — densidad de tinción 0..1 (OD de rojo, alto = estructura densa)
+      blueness — (B-R) normalizado 0..1
+      stain    — evidencia combinada density*blueness 0..1
+      tissue   — máscara booleana de tejido (no fondo blanco)
+    """
+    rgb = tile_rgb.astype(np.float32)
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc = np.maximum(np.maximum(R, G), B)
+    minc = np.minimum(np.minimum(R, G), B)
+    sat = (maxc - minc) / (maxc + 1e-3)
+    # Densidad óptica del rojo: -log10((R+1)/256). Alto donde R es bajo (tinción densa).
+    od_r = -np.log10((R + 1.0) / 256.0)
+    density = np.clip(od_r / np.log10(256.0), 0.0, 1.0)
+    blueness = np.clip((B - R) / 255.0, 0.0, 1.0)
+    stain = np.clip(density * (0.5 + 0.5 * (blueness > 0.05)), 0.0, 1.0) * (blueness > 0.02)
+    return {
+        "density": density.astype(np.float32),
+        "blueness": blueness.astype(np.float32),
+        "stain": stain.astype(np.float32),
+        "sat": sat.astype(np.float32),
+        "maxc": maxc.astype(np.float32),
+    }
+
+
+def _tile_root_mask_stain(m: dict[str, np.ndarray], p: WeakSegParams) -> np.ndarray:
+    """Tejido = no fondo blanco. Fondo: canal máximo alto y baja saturación."""
+    bg = (m["maxc"] > p.stain_bg_maxc) & (m["sat"] < p.stain_bg_sat)
+    tissue = ~bg
+    k = np.ones((3, 3), np.uint8)
+    t = cv2.morphologyEx(tissue.astype(np.uint8), cv2.MORPH_OPEN, k)
+    t = cv2.morphologyEx(t, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    t = binary_fill_holes(t > 0)
+    if float(t.mean()) < p.root_min_cov:
+        return np.ones(t.shape, dtype=bool)
+    return t
+
+
+def _remove_small(mask: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 1 or not mask.any():
+        return mask
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    keep = np.zeros_like(mask, dtype=bool)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep |= lbl == i
+    return keep
+
+
+def _tile_hyphae_stain(
+    m: dict[str, np.ndarray],
+    root: np.ndarray,
+    p: WeakSegParams,
+    exclude: np.ndarray | None = None,
+) -> np.ndarray:
+    """Hifas: Frangi multiescala + gate ABSOLUTO de prominencia de cresta.
+
+    Las hifas son finas y densas y resaltan localmente. El top-hat blanco
+    (density - apertura) aísla crestas finas. El gate absoluto es clave: en
+    tinción uniforme el top-hat es ~0 en todas partes ⇒ no genera speckle
+    (a diferencia de un umbral por percentil, que siempre dispara su top X%).
+    """
+    dens = m["density"]
+    vessel = frangi(dens, sigmas=list(p.ih_frangi_sigmas), black_ridges=False)
+    d8 = (np.clip(dens, 0, 1) * 255).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (p.ih_tophat_disk, p.ih_tophat_disk))
+    tophat = cv2.morphologyEx(d8, cv2.MORPH_TOPHAT, k).astype(np.float32) / 255.0
+    valid = vessel[root]
+    if valid.size == 0:
+        return np.zeros_like(root, dtype=bool)
+    thr = float(np.percentile(valid, p.frangi_pctl))
+    prom_thr = max(p.ih_tophat_abs, float(np.percentile(tophat[root], p.ih_prom_pctl)))
+    mask = (vessel >= thr) & (tophat >= prom_thr) & root
+    if exclude is not None:
+        mask = mask & ~exclude
+    return _remove_small(mask, p.ih_min_area) & root
+
+
+def _tile_vesicle_stain(m: dict[str, np.ndarray], root: np.ndarray, p: WeakSegParams) -> np.ndarray:
+    """Vesículas: blobs LoG oscuros/azules sobre el canal de tinción, rellenos.
+
+    Las vesículas son cuerpos redondos densos (a menudo con borde oscuro y centro
+    algo más claro). Se detectan como blobs LoG (Lindeberg 1998) y se etiquetan
+    como DISCO RELLENO — no como anillo — para no dejar el interior sin clase y
+    que el borde no lo capture Frangi como hifa. Se exige que el blob sea más
+    denso que su entorno (z-score) y de radio acotado (no regiones enormes).
+    """
+    from skimage.feature import blob_log
+
+    dens = m["density"] * root
+    if dens.max() <= 1e-6:
+        return np.zeros_like(root, dtype=bool)
+    blobs = blob_log(
+        dens,
+        min_sigma=p.ves_min_sigma,
+        max_sigma=p.ves_max_sigma,
+        num_sigma=8,
+        threshold=p.ves_blob_thr,
+    )
+    out = np.zeros(root.shape, dtype=np.uint8)
+    if blobs.size == 0:
+        return out > 0
+    h, w = root.shape
+    dens_full = m["density"]
+    for y, x, sigma in blobs:
+        r = int(round(sigma * np.sqrt(2)))
+        if r < 2 or r > p.ves_max_radius:
+            continue
+        if float(np.pi * r * r) < p.vesicle_min_area:
+            continue
+        yy, xx = int(round(y)), int(round(x))
+        # Disco interior vs anillo circundante (r .. ~1.8r): vesícula = punto oscuro LOCAL.
+        rr = int(round(r * 1.8))
+        yb0, yb1 = max(0, yy - rr), min(h, yy + rr + 1)
+        xb0, xb1 = max(0, xx - rr), min(w, xx + rr + 1)
+        patch = dens_full[yb0:yb1, xb0:xb1]
+        if patch.size == 0:
+            continue
+        cy, cx = yy - yb0, xx - xb0
+        yy_g, xx_g = np.ogrid[: patch.shape[0], : patch.shape[1]]
+        dist2 = (yy_g - cy) ** 2 + (xx_g - cx) ** 2
+        disk = dist2 <= r * r
+        annulus = (dist2 > r * r) & (dist2 <= rr * rr)
+        if disk.sum() < 4 or annulus.sum() < 4:
+            continue
+        ann_mean = float(patch[annulus].mean())
+        if ann_mean >= p.ves_bg_max:  # entorno tan oscuro como el blob ⇒ colonización densa, no vesícula
+            continue
+        contrast = float(patch[disk].mean()) - ann_mean
+        if contrast < p.ves_contrast_min:
+            continue
+        cv2.circle(out, (xx, yy), r, 1, thickness=-1)
+    return (out > 0) & root
+
+
+def _tile_arbuscule_stain(
+    m: dict[str, np.ndarray], root: np.ndarray, hyphae: np.ndarray, vesicle: np.ndarray, p: WeakSegParams
+) -> np.ndarray:
+    """Arbúsculos: alta densidad de tinción + textura fina (ramificación densa),
+    excluyendo lo tubular (hifas) y los blobs redondos (vesículas).
+    """
+    dens = m["density"]
+    # energía de alta frecuencia = densidad menos su versión suavizada (detalle fino)
+    low = gaussian_filter(dens, sigma=3.0)
+    fine = np.abs(dens - low)
+    fine = gaussian_filter(fine, sigma=1.0)
+    valid = root & ~hyphae & ~vesicle
+    if valid.sum() == 0:
+        return np.zeros_like(root, dtype=bool)
+    fine_thr = float(np.percentile(fine[valid], p.arb_fine_pctl))
+    dens_thr = float(np.percentile(dens[root], p.arb_density_pctl))
+    arb = (fine >= fine_thr) & (dens >= dens_thr) & valid
+    k = np.ones((3, 3), np.uint8)
+    arb = cv2.morphologyEx(arb.astype(np.uint8), cv2.MORPH_OPEN, k) > 0
+    arb = _remove_small(arb, p.arb_min_area)
+    return arb & root
+
+
+def _ambiguous_stain_mask(m: dict[str, np.ndarray], root: np.ndarray, p: WeakSegParams) -> np.ndarray:
+    """Regiones GRANDES de azul saturado = estructura no resoluble.
+
+    Cuando la tinción satura (density y blueness altas) sobre un área extensa, no
+    se distinguen estructuras discretas; forzar V/IH/A/H ahí mete ruido. Se marca
+    como ambiguo (→ ignore, fuera de la loss). Una vesícula o hifa real es un
+    punto/cresta LOCAL pequeño: la apertura morfológica lo elimina y solo
+    sobreviven las regiones saturadas grandes.
+    """
+    dens = m["density"].astype(np.float32)
+    blue = m["blueness"].astype(np.float32)
+    sat = ((dens >= p.amb_density) & (blue >= p.amb_blueness) & root).astype(np.float32)
+    if sat.sum() < 1:
+        return np.zeros_like(root, dtype=bool)
+    win = int(p.amb_win)
+    frac = cv2.blur(sat, (win, win))  # fracción local saturada (robusto a la forma)
+    return (frac >= p.amb_frac) & root
+
+
+def segment_tile_stain_aware(tile_rgb: np.ndarray, params: WeakSegParams) -> dict[str, np.ndarray]:
+    m = _stain_maps(tile_rgb)
+    root = _tile_root_mask_stain(m, params)
+    # Orden: vesículas primero (cuerpos rellenos), luego hifas excluyéndolas
+    # (para que el borde de la vesícula no se etiquete como IH), luego arbúsculos.
+    vesicle = _tile_vesicle_stain(m, root, params)
+    hyphae = _tile_hyphae_stain(m, root, params, exclude=vesicle)
+    arbuscule = _tile_arbuscule_stain(m, root, hyphae, vesicle, params)
+    ambiguous = _ambiguous_stain_mask(m, root, params)
+    return {
+        "root": root,
+        "hyphae": hyphae,
+        "vesicle": vesicle,
+        "arbuscule": arbuscule,
+        "stain": m["stain"],
+        "density": m["density"],
+        "ambiguous": ambiguous,
+    }
+
+
 def segment_tile(tile_rgb: np.ndarray, params: WeakSegParams) -> dict[str, np.ndarray]:
+    if getattr(params, "stain_aware", True):
+        return segment_tile_stain_aware(tile_rgb, params)
     gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY)
     root_mask = _tile_root_mask(gray, params)
     hyphae_mask = _tile_hyphae_mask(gray, root_mask, params)

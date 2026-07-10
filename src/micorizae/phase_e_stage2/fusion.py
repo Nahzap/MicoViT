@@ -7,14 +7,22 @@ import numpy as np
 DEFAULT_WEIGHTS = {"A": 0.40, "B": 0.40, "C": 0.20}
 
 
+def _active_branch_weights(weights: dict[str, float] | None) -> dict[str, float]:
+    """Ramas con peso > 0 para inferencia/fusión."""
+    w = weights or DEFAULT_WEIGHTS
+    return {k: float(v) for k, v in w.items() if float(v) > 0.0}
+
+
 def fuse_probabilities_mc(
     probs_per_branch: dict[str, np.ndarray],
     weights: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Promedio ponderado de distribuciones (K,) por tile -> (N, K)."""
-    weights = weights or DEFAULT_WEIGHTS
-    branches = [k for k in probs_per_branch if k in weights]
-    w = np.array([weights[k] for k in branches], dtype=np.float64)
+    wmap = _active_branch_weights(weights)
+    branches = [k for k in probs_per_branch if k in wmap]
+    if not branches:
+        raise ValueError("fuse_probabilities_mc: ninguna rama activa")
+    w = np.array([wmap[k] for k in branches], dtype=np.float64)
     w = w / w.sum()
     stack = np.stack([probs_per_branch[k] for k in branches], axis=0)  # (B, N, K)
     return (w[:, None, None] * stack).sum(axis=0)
