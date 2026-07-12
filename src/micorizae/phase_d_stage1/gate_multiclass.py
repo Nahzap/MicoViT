@@ -1,4 +1,9 @@
-"""Entrenamiento e inferencia del gate Stage1 multiclas (Bg / M- / M+)."""
+"""DEPRECATED / QUARANTINE — Gen2 legacy Gate multiclass training/inference.
+
+Canonical Gate path: ``gate_tile_dino`` + ``gate4``. Do not use for new work.
+
+Entrenamiento e inferencia del gate Stage1 multiclas (Bg / M- / M+).
+"""
 
 from __future__ import annotations
 

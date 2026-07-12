@@ -1,8 +1,12 @@
-"""U2NETP multiclas para segmentación morfológica píxel — Fase 2."""
+"""DEPRECATED / QUARANTINE — U2Net pixel orphan.
+
+Canonical Stage2-Pixel model: ``pixel_vit_model``. Do not use for new work.
+"""
 
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +28,11 @@ class PixelMorphU2Net(nn.Module):
         num_classes: int = NUM_PIXEL_CLASSES,
         weights_path: Optional[Path] = None,
     ):
+        warnings.warn(
+            "PixelMorphU2Net is deprecated; canonical Stage2-Pixel model is pixel_vit_model.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self.num_classes = num_classes
         self.net = U2NETP(in_ch=3, out_ch=num_classes)

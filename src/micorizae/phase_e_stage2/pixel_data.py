@@ -174,6 +174,26 @@ def _augment_batch(rgb: torch.Tensor, labels: torch.Tensor, p: float = 0.5) -> t
         k = int(torch.randint(1, 4, (1,), device=rgb.device).item())
         rgb = torch.rot90(rgb, k, [-2, -1])
         labels = torch.rot90(labels, k, [-2, -1])
+    # PSF / defocus blur (plan §3.4) — σ aleatorio sobre el batch
+    try:
+        import config as user_config
+
+        psf_prob = float(getattr(user_config, "STAGE2_PIXEL_AUG_PSF_PROB", 0.35))
+        sigmas_s = str(getattr(user_config, "STAGE2_PIXEL_AUG_PSF_SIGMAS", "0.5,1.0,1.5,2.0,2.5"))
+        sigmas = [float(x) for x in sigmas_s.split(",") if x.strip()]
+    except Exception:
+        psf_prob, sigmas = 0.35, [0.5, 1.0, 1.5, 2.0, 2.5]
+    if sigmas and torch.rand(1, device=rgb.device).item() < psf_prob:
+        sigma = float(sigmas[int(torch.randint(0, len(sigmas), (1,), device=rgb.device).item())])
+        if sigma > 0:
+            # blur separable aproximado vía avg_pool (rápido, sin kornia)
+            k = max(3, int(round(sigma * 4)) | 1)
+            pad = k // 2
+            rgb = torch.nn.functional.avg_pool2d(
+                torch.nn.functional.pad(rgb, (pad, pad, pad, pad), mode="reflect"),
+                kernel_size=k,
+                stride=1,
+            )
     return rgb, labels
 
 

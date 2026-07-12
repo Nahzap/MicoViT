@@ -1,4 +1,8 @@
-"""Bucle de entrenamiento 100% CUDA por rama.
+"""DEPRECATED / QUARANTINE — Gen1 Gate ensemble training loop.
+
+Canonical Gate path: ``gate_tile_dino`` + ``gate4``. Do not use for new work.
+
+Bucle de entrenamiento 100% CUDA por rama.
 
 Diferencias con `train.py`:
     - sin DataLoader (CPU bottleneck eliminado)

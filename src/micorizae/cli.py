@@ -1117,6 +1117,36 @@ def recover_gate_am_report_cmd(
     recover_gate_am_run_report(run_id=run_id)
 
 
+@app.command(name="gate-am-external-eval")
+def gate_am_external_eval_cmd(
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run-id",
+        help="Run Gate en outputs/ (default: run_meta.json del checkpoint).",
+    ),
+    max_images: Optional[int] = typer.Option(
+        None,
+        "--max-images",
+        help="Limite imagenes holdout externo (default config GATE_AMFINDER_EXTERNAL_MAX_IMAGES; 0=todas).",
+    ),
+    force_rebuild: bool = typer.Option(
+        False,
+        "--force-rebuild",
+        help="Recompilar cache embed auxiliar AMFinder (p. ej. gate_amfinder_external_n10_v1).",
+    ),
+    skip_maps: bool = typer.Option(False, "--skip-maps", help="Omitir mapas por imagen."),
+):
+    """Validacion externa AMFinder post-Gate (Stage1). No entrena ni ejecuta Stage2."""
+    from .gate_runflow import run_gate_am_external_eval
+
+    run_gate_am_external_eval(
+        run_id=run_id,
+        max_images=max_images,
+        force_rebuild=force_rebuild,
+        skip_maps=skip_maps,
+    )
+
+
 @app.command(name="infer-gate-am")
 def infer_gate_am_cmd(
     image: Optional[Path] = typer.Option(None, help="Imagen AM (default config.py)"),
@@ -1407,7 +1437,7 @@ def build_stage2_pixel_cache_cmd(
         collect_mplus_tiles_for_h5,
         ensure_stage2_pixel_h5_cache,
     )
-    from .phase_i_weakseg.pipeline import WeakSegParams
+    from micorizae.morph_core import WeakSegParams
 
     gate_run_id = str(_cfg("STAGE2_PIXEL_GATE_RUN_ID", _cfg("STAGE2_GATE_RUN_ID", "")))
     input_size = int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224))
@@ -1419,6 +1449,8 @@ def build_stage2_pixel_cache_cmd(
             vesicle_circularity_min=float(_cfg("STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN", 0.85)),
             frangi_pctl=float(_cfg("STAGE2_PIXEL_FRANGI_PCTL", 82.0)),
             arbuscule_pctl=float(_cfg("STAGE2_PIXEL_ARBUSCULE_PCTL", 93.0)),
+            ves_max_radius=int(_cfg("STAGE2_PIXEL_VESICLE_MAX_RADIUS", 0)),
+            ves_max_sigma=float(_cfg("STAGE2_PIXEL_VESICLE_MAX_SIGMA", 40.0)),
         ),
         seam_sigma=0.0,
     )
@@ -1431,9 +1463,11 @@ def build_stage2_pixel_cache_cmd(
     )
     _w = int(_cfg("STAGE2_PIXEL_H5_BUILD_WORKERS", 0))
     _w_label = str(_w) if _w > 0 else "auto"
+    _inflight = int(_cfg("STAGE2_PIXEL_H5_BUILD_INFLIGHT", 4))
     print(
         f"[Stage2-Pixel] build-cache: {len(combined_df):,} tiles M+ | "
-        f"force_rebuild={force_rebuild} | {_w_label} workers CPU (rgb+label+priors)",
+        f"force_rebuild={force_rebuild} | {_w_label} workers CPU | "
+        f"batch={int(_cfg('STAGE2_PIXEL_H5_BUILD_BATCH', 128))} inflight={_inflight}",
         flush=True,
     )
     h5_store = ensure_stage2_pixel_h5_cache(
@@ -1442,11 +1476,12 @@ def build_stage2_pixel_cache_cmd(
         device=device,
         input_size=input_size,
         gate_run_id=gate_run_id,
-        batch_size=int(_cfg("STAGE2_PIXEL_H5_BUILD_BATCH", 8)),
+        batch_size=int(_cfg("STAGE2_PIXEL_H5_BUILD_BATCH", 128)),
         compression=str(_cfg("STAGE2_PIXEL_H5_COMPRESSION", "lzf")),
         force_rebuild=bool(force_rebuild),
         store_priors=bool(_cfg("STAGE2_PIXEL_H5_STORE_PRIORS", True)),
         workers=_w if _w > 0 else None,
+        max_inflight=_inflight,
     )
     print(
         f"[Stage2-Pixel] build-cache LISTO -> {h5_store.h5_path} | "
@@ -1497,7 +1532,7 @@ def train_stage2_pixel_cmd(
         train_pixel_morph_gpu,
     )
     from .phase_e_stage2.pixel_prior_loss import PriorLossWeights
-    from .phase_i_weakseg.pipeline import WeakSegParams
+    from micorizae.morph_core import WeakSegParams
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA no disponible.")
@@ -1530,6 +1565,8 @@ def train_stage2_pixel_cmd(
             vesicle_circularity_min=float(_cfg("STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN", 0.85)),
             frangi_pctl=float(_cfg("STAGE2_PIXEL_FRANGI_PCTL", 82.0)),
             arbuscule_pctl=float(_cfg("STAGE2_PIXEL_ARBUSCULE_PCTL", 93.0)),
+            ves_max_radius=int(_cfg("STAGE2_PIXEL_VESICLE_MAX_RADIUS", 0)),
+            ves_max_sigma=float(_cfg("STAGE2_PIXEL_VESICLE_MAX_SIGMA", 40.0)),
         ),
         seam_sigma=0.0,
     )
@@ -1790,9 +1827,10 @@ def train_stage2_pixel_cmd(
             prior_loss_enabled=bool(_cfg("STAGE2_PIXEL_PRIOR_LOSS_ENABLED", True)),
             prior_loss_weights=PriorLossWeights(
                 ih=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_IH_WEIGHT", 0.05)),
-                v=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_V_WEIGHT", 0.05)),
+                v=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_V_WEIGHT", 0.08)),
                 prec=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_PREC_WEIGHT", 0.02)),
-                a=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_A_WEIGHT", 0.0)),
+                a=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_A_WEIGHT", 0.05)),
+                h_stain=float(_cfg("STAGE2_PIXEL_PRIOR_LOSS_H_STAIN_WEIGHT", 0.03)),
             ),
             morph_params_for_prior=morph,
             prior_loss_workers=int(_cfg("STAGE2_PIXEL_PRIOR_LOSS_WORKERS", 4)),
@@ -2081,7 +2119,7 @@ def infer_stage2_cmd(
             render_smoothness_heatmap,
         )
         from .phase_e_stage2.pixel_vit_model import build_pixel_morph_vit
-        from .phase_i_weakseg.pipeline import WeakSegParams
+        from micorizae.morph_core import WeakSegParams
 
         backend = str(_cfg("STAGE2_PIXEL_BACKEND", "vit"))
         vit_name = str(_cfg("STAGE2_PIXEL_VIT_MODEL", "dinov2_vits14"))
@@ -2422,6 +2460,140 @@ def weakseg_gui_cmd():
     from .phase_i_weakseg.gui import launch_weakseg_gui
 
     launch_weakseg_gui()
+
+
+@app.command(name="analyze-image")
+def analyze_image_cmd(
+    image: Path = typer.Option(..., help="Cualquier imagen AM (JPG). No requiere tiles_index."),
+    lineage: str = typer.Option("AM", help="Linaje AM/ERM"),
+    tile_size: Optional[int] = typer.Option(None, help="Tamaño tile (default: 252 AM / 126 ERM)"),
+    batch_size: Optional[int] = typer.Option(None, help="Batch Gate"),
+    gate_run_id: Optional[str] = typer.Option(None, help="Override Gate run_id"),
+):
+    """Experto digital: subdivisión runtime → Gate → Stage2-Pixel → stitch+merge.
+
+    Contrato plan §0.3 / S9: funciona sin ``tiles_index`` preexistente.
+    """
+    import json
+
+    import numpy as np
+    import torch
+    from PIL import Image as PILImage
+
+    from .phase_b_tiling.runtime_grid import build_tile_grid_for_image
+    from .phase_d_stage1.gate_tile_dino import infer_image_gate_probe_gpu, load_gate_probe_bundle
+    from .phase_e_stage2.infer_pixel_gpu import infer_image_pixel_morph
+    from .phase_e_stage2.pixel_morph import render_diagnostic_overlay, render_pixel_class_map
+    from .phase_e_stage2.pixel_vit_model import build_pixel_morph_vit
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA no disponible. Experto digital es GPU-only.")
+
+    lineage = str(lineage).upper()
+    ts = int(tile_size) if tile_size is not None else (252 if lineage == "AM" else 126)
+    batch_size = int(batch_size if batch_size is not None else _cfg("DEFAULT_BATCH_SIZE", 32))
+    gate_run_id = str(gate_run_id or _cfg("STAGE2_PIXEL_GATE_RUN_ID", _cfg("STAGE2_GATE_RUN_ID", "")))
+    paths = get_paths()
+
+    run = RunOutputs.create("analyze_image", suffix=f"{lineage}__{image.stem}")
+    device = torch.device("cuda")
+
+    # 1) Subdivisión SIEMPRE
+    grid = build_tile_grid_for_image(image, tile_size=ts, lineage=lineage, relative_to=paths.root)
+    log.info(f"[Experto] grid runtime: {len(grid)} tiles @ {ts}px ({image.name})")
+
+    # 2) Gate por tile
+    try:
+        gate_bundle = load_gate_probe_bundle(device=device, gate_run_id=gate_run_id or None)
+    except (FileNotFoundError, RuntimeError) as e:
+        log.error(str(e))
+        raise typer.Exit(code=1) from e
+
+    s1_df = infer_image_gate_probe_gpu(image, gate_bundle, batch_size=batch_size)
+    if s1_df.empty:
+        # Si Gate no produce filas (sin manifest), etiquetar grid vía coords
+        log.warning("[Experto] Gate sin filas; se usará grid runtime vacío de M+.")
+        mplus = grid.iloc[0:0].copy()
+    else:
+        # Fusionar predicciones Gate con coords del grid runtime
+        if "row" in s1_df.columns and "col" in s1_df.columns:
+            mplus = s1_df.copy()
+            if "x0" not in mplus.columns:
+                mplus = mplus.merge(
+                    grid[["row", "col", "x0", "y0", "x1", "y1", "tile_size"]],
+                    on=["row", "col"],
+                    how="left",
+                )
+        else:
+            mplus = s1_df
+        # Filtrar M+
+        if "stage1_pred" in mplus.columns:
+            mplus = mplus[mplus["stage1_pred"].astype(str) == "Mplus"].copy()
+        elif "pred" in mplus.columns:
+            mplus = mplus[mplus["pred"].astype(str) == "Mplus"].copy()
+        elif "stage1" in mplus.columns:
+            mplus = mplus[mplus["stage1"].astype(str) == "Mplus"].copy()
+
+    n_mplus = len(mplus)
+    log.info(f"[Experto] tiles M+: {n_mplus} / {len(grid)}")
+
+    # 3) Stage2-Pixel
+    ckpt = paths.root / "models" / "checkpoints" / f"stage2_{lineage.lower()}" / "stage2_pixel_vit_best.pt"
+    full_seg = None
+    tile_table = None
+    if n_mplus > 0 and ckpt.is_file():
+        model = build_pixel_morph_vit(
+            backbone_name=str(_cfg("STAGE2_PIXEL_VIT_MODEL", "dinov2_vits14")),
+            freeze_backbone=True,
+            decoder_type=str(_cfg("STAGE2_PIXEL_DECODER_TYPE", "multiscale")),
+        )
+        state = torch.load(ckpt, map_location=device, weights_only=False)
+        sd = state.get("model", state) if isinstance(state, dict) else state
+        model.load_state_dict(sd, strict=False)
+        model.to(device).eval()
+        if "image_path" not in mplus.columns:
+            mplus = mplus.copy()
+            mplus["image_path"] = image.resolve().relative_to(paths.root).as_posix()
+        full_seg, tile_table, _ = infer_image_pixel_morph(
+            image,
+            mplus,
+            backend="vit",
+            model=model,
+            device=device,
+            input_size=int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224)),
+        )
+    elif n_mplus == 0:
+        log.warning("[Experto] Sin tiles M+ — mapa vacío.")
+        PILImage.MAX_IMAGE_PIXELS = None
+        with PILImage.open(image) as im:
+            w, h = im.size
+        full_seg = np.zeros((h, w), dtype=np.uint8)
+    else:
+        log.error(f"[Experto] Checkpoint Stage2-Pixel no encontrado: {ckpt}")
+        raise typer.Exit(code=1)
+
+    # 4) Salidas
+    PILImage.MAX_IMAGE_PIXELS = None
+    rgb = np.asarray(PILImage.open(image).convert("RGB"))
+    class_map = render_pixel_class_map(full_seg)
+    overlay = render_diagnostic_overlay(rgb, full_seg, alpha=0.45)
+    out_dir = run.root / "maps"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    PILImage.fromarray(class_map).save(out_dir / f"{image.stem}__pixel_classes.png")
+    PILImage.fromarray(overlay).save(out_dir / f"{image.stem}__overlay.png")
+    if tile_table is not None and not tile_table.empty:
+        tile_table.to_parquet(run.root / "tile_morph.parquet", index=False)
+    meta = {
+        "image": str(image),
+        "lineage": lineage,
+        "tile_size": ts,
+        "n_tiles": int(len(grid)),
+        "n_mplus": int(n_mplus),
+        "gate_run_id": gate_run_id,
+        "contract": "analyze-image runtime_grid §0.3",
+    }
+    (run.root / "analyze_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log.info(f"[Experto] OK → {run.root}")
 
 
 @app.command()

@@ -13,9 +13,10 @@ from .pixel_class_map import PIXEL_CLASS_TO_IDX
 @dataclass
 class PriorLossWeights:
     ih: float = 0.05
-    v: float = 0.05
+    v: float = 0.08
     prec: float = 0.02
-    a: float = 0.0
+    a: float = 0.05
+    h_stain: float = 0.03
 
 
 @dataclass
@@ -24,6 +25,7 @@ class PriorLossBreakdown:
     v: torch.Tensor
     prec: torch.Tensor
     a: torch.Tensor
+    h_stain: torch.Tensor
     total: torch.Tensor
 
 
@@ -45,13 +47,7 @@ def prior_ih_loss(logits: torch.Tensor, frangi_e: torch.Tensor, root_mask: torch
 
 
 def prior_a_loss(logits: torch.Tensor, arb_e: torch.Tensor, root_mask: torch.Tensor) -> torch.Tensor:
-    """MSE entre softmax A y evidencia de arbúsculo (textura fina × gate densidad) v3.
-
-    Simétrico a ``prior_ih_loss``: ancla el canal A del ViT a la evidencia continua A
-    (``prior_evidence[:, A]``), restringido al tejido radicular. Solo activa cuando el
-    peso ``a`` > 0 (ver ``combine_prior_losses``); en tejido sin evidencia A la señal es
-    ~0, así que no fuerza falsos positivos donde el prior no ve arbúsculo.
-    """
+    """MSE entre softmax A y evidencia de arbúsculo (arb-score v4)."""
     logits = _resize_logits(logits, arb_e)
     probs = F.softmax(logits, dim=1)
     a = probs[:, PIXEL_CLASS_TO_IDX["A"]]
@@ -59,6 +55,17 @@ def prior_a_loss(logits: torch.Tensor, arb_e: torch.Tensor, root_mask: torch.Ten
     if not mask.any():
         return torch.tensor(0.0, device=logits.device)
     return F.mse_loss(a[mask], arb_e[mask])
+
+
+def prior_h_stain_loss(logits: torch.Tensor, h_e: torch.Tensor, root_mask: torch.Tensor) -> torch.Tensor:
+    """MSE entre softmax H y evidencia H_stain (tinción sin estructura)."""
+    logits = _resize_logits(logits, h_e)
+    probs = F.softmax(logits, dim=1)
+    h = probs[:, PIXEL_CLASS_TO_IDX["H"]]
+    mask = root_mask > 0.5
+    if not mask.any():
+        return torch.tensor(0.0, device=logits.device)
+    return F.mse_loss(h[mask], h_e[mask])
 
 
 def prior_v_loss(logits: torch.Tensor, vesicle_mask: torch.Tensor) -> torch.Tensor:
@@ -70,7 +77,7 @@ def prior_v_loss(logits: torch.Tensor, vesicle_mask: torch.Tensor) -> torch.Tens
 
 
 def precedence_loss(logits: torch.Tensor, vesicle_mask: torch.Tensor, delta: float = 0.05) -> torch.Tensor:
-    """Penaliza softmax V > IH en regiones vesiculares weak."""
+    """Penaliza softmax V > IH en regiones vesiculares weak; A > V."""
     logits = _resize_logits(logits, vesicle_mask.unsqueeze(1))
     probs = F.softmax(logits, dim=1)
     ih = probs[:, PIXEL_CLASS_TO_IDX["IH"]]
@@ -91,17 +98,27 @@ def combine_prior_losses(
     *,
     weights: PriorLossWeights,
 ) -> PriorLossBreakdown:
-    """prior_evidence: (B,5,H,W) — canal IH = Frangi, V = circularidad, etc."""
+    """prior_evidence: (B,5,H,W) — canal IH = Frangi, V = circularidad/LoG, A = arb-score, H = stain."""
     root = (prior_evidence.sum(dim=1) > 0).float()
     frangi = prior_evidence[:, PIXEL_CLASS_TO_IDX["IH"]]
     l_ih = prior_ih_loss(logits, frangi, root)
     l_v = prior_v_loss(logits, vesicle_mask)
     l_prec = precedence_loss(logits, vesicle_mask)
-    # P3.1: canal A solo se calcula si pesa (>0), para no gastar cómputo cuando está apagado.
     if weights.a > 0.0:
         arb = prior_evidence[:, PIXEL_CLASS_TO_IDX["A"]]
         l_a = prior_a_loss(logits, arb, root)
     else:
         l_a = torch.tensor(0.0, device=logits.device)
-    total = weights.ih * l_ih + weights.v * l_v + weights.prec * l_prec + weights.a * l_a
-    return PriorLossBreakdown(ih=l_ih, v=l_v, prec=l_prec, a=l_a, total=total)
+    if getattr(weights, "h_stain", 0.0) > 0.0:
+        h_e = prior_evidence[:, PIXEL_CLASS_TO_IDX["H"]]
+        l_h = prior_h_stain_loss(logits, h_e, root)
+    else:
+        l_h = torch.tensor(0.0, device=logits.device)
+    total = (
+        weights.ih * l_ih
+        + weights.v * l_v
+        + weights.prec * l_prec
+        + weights.a * l_a
+        + getattr(weights, "h_stain", 0.0) * l_h
+    )
+    return PriorLossBreakdown(ih=l_ih, v=l_v, prec=l_prec, a=l_a, h_stain=l_h, total=total)

@@ -8,6 +8,7 @@ Subcomandos avanzados:
     python run.py build-gate-attention-cache
     python run.py train-gate-am
     python run.py recover-gate-am-report
+    python run.py gate-am-external-eval [--run-id ...] [--max-images 10]
     python run.py infer-gate-am --image <ruta>
     python run.py --help
 """

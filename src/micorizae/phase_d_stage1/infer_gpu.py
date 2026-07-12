@@ -1,4 +1,8 @@
-"""Inferencia full-image 100% CUDA.
+"""DEPRECATED / QUARANTINE — Gen1 Gate ensemble inference.
+
+Canonical Gate path: ``gate_tile_dino`` + ``gate4``. Do not use for new work.
+
+Inferencia full-image 100% CUDA.
 
 Para una imagen:
     1) decode_jpeg_gpu (nvJPEG) -> GPUImage en VRAM

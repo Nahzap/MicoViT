@@ -103,6 +103,7 @@ def _batch_tiles_cpu_to_gpu(
     device: torch.device,
     *,
     pad_value: int = 255,
+    workers: int = 0,
 ) -> torch.Tensor:
     """Crop en RAM + sube solo el mini-batch a VRAM (imagenes gigantes)."""
     from ..phase_b_tiling.tile_cutter import crop_tile_from_array
@@ -111,13 +112,48 @@ def _batch_tiles_cpu_to_gpu(
         return torch.empty((0, 3, 0, 0), dtype=torch.uint8, device=device)
     ts = rowcols[0][2]
     stacked = np.full((len(rowcols), ts, ts, 3), pad_value, dtype=np.uint8)
-    for i, (row, col, tile_size) in enumerate(rowcols):
-        if tile_size != ts:
-            raise ValueError("batch_tiles_cpu_to_gpu requiere tile_size uniforme")
-        stacked[i] = crop_tile_from_array(
-            image_arr, row=row, col=col, tile_size=ts, pad_value=pad_value
-        )
+    if workers > 1 and len(rowcols) >= 8:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _crop_one(i: int, row: int, col: int, tile_size: int) -> tuple[int, np.ndarray]:
+            return i, crop_tile_from_array(
+                image_arr, row=row, col=col, tile_size=tile_size, pad_value=pad_value
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = [
+                (i, row, col, tile_size)
+                for i, (row, col, tile_size) in enumerate(rowcols)
+            ]
+            for i, tile in pool.map(lambda args: _crop_one(*args), jobs, chunksize=max(1, len(jobs) // workers)):
+                stacked[i] = tile
+    else:
+        for i, (row, col, tile_size) in enumerate(rowcols):
+            if tile_size != ts:
+                raise ValueError("batch_tiles_cpu_to_gpu requiere tile_size uniforme")
+            stacked[i] = crop_tile_from_array(
+                image_arr, row=row, col=col, tile_size=ts, pad_value=pad_value
+            )
     return torch.from_numpy(stacked).permute(0, 3, 1, 2).to(device, non_blocking=True)
+
+
+def _prepare_embed_tile_batch(
+    *,
+    image_arr: np.ndarray | None,
+    gimg: "GPUImage | None",
+    rowcols: list[tuple[int, int, int]],
+    device: torch.device,
+    cpu_decode_workers: int = 0,
+) -> torch.Tensor:
+    if image_arr is not None:
+        return _batch_tiles_cpu_to_gpu(
+            image_arr, rowcols, device, workers=cpu_decode_workers
+        )
+    if gimg is None:
+        raise ValueError("Se requiere image_arr o gimg para preparar tiles")
+    from ..phase_b_tiling.gpu_io import batch_tiles_gpu
+
+    return batch_tiles_gpu(gimg, rowcols)
 
 
 def _forward_embed_batch(
@@ -130,9 +166,14 @@ def _forward_embed_batch(
     labels: Optional[torch.Tensor] = None,
     u2net: Optional[nn.Module] = None,
     pooling_mode: str = "none",
+    fused_attention: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     from .gate_bg_pooling import bg_only_pooling_mask, u2net_saliency_batch
-    from .gate_dino_attention import attention_maps_to_numpy, extract_dino_cls_patch_attention
+    from .gate_dino_attention import (
+        attention_maps_to_numpy,
+        extract_dino_cls_patch_attention,
+        forward_dino_pooled_with_attention,
+    )
 
     views = build_views_gpu(
         tiles, target_size=dino_input_size, seg_target_size=seg_target_size
@@ -143,6 +184,18 @@ def _forward_embed_batch(
             u2net, views.seg, saliency_size=dino_input_size
         )
         pool_mask = bg_only_pooling_mask(labels, sal, pooling_mode=pooling_mode)
+    if attention_cfg is not None and fused_attention:
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            feat, attn_maps = forward_dino_pooled_with_attention(
+                backbone,
+                views.rgb,
+                cfg=attention_cfg,
+                dino_input_size=dino_input_size,
+                mask=pool_mask,
+            )
+        feat_np = feat.detach().half().cpu().numpy()
+        attn_np = attention_maps_to_numpy(attn_maps)
+        return feat_np, attn_np
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         feat = backbone(views.rgb, mask=pool_mask)
     feat_np = feat.detach().half().cpu().numpy()
@@ -254,8 +307,27 @@ def _format_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+_embed_msg_prefix = "[Gate embed]"
+
+
+def _is_external_embed_cache(cpaths: "EmbedCachePaths") -> bool:
+    stem = cpaths.embed.stem.lower()
+    return "amfinder" in stem or "_external_" in stem
+
+
+def _activate_embed_log_context(cpaths: "EmbedCachePaths") -> None:
+    """Prefijo de log distinto cuando el embed es auxiliar de validacion externa AMFinder."""
+    global _embed_msg_prefix
+    if _is_external_embed_cache(cpaths):
+        _embed_msg_prefix = "[Gate embed | VALIDACION EXTERNA AMFinder]"
+    else:
+        _embed_msg_prefix = "[Gate embed]"
+
+
 def _progress_print(msg: str) -> None:
     """Salida inmediata en terminal (Rich no hace flush durante operaciones largas)."""
+    if msg.startswith("[Gate embed]"):
+        msg = msg.replace("[Gate embed]", _embed_msg_prefix, 1)
     print(msg, flush=True)
 
 
@@ -1074,6 +1146,8 @@ def build_gate_embed_cache(
     empty_cache_every_n_batches: int = 0,
     gc_collect_every_n_batches: int = 0,
     memmap_flush_every_n_images: int = 5,
+    cpu_decode_workers: int = 0,
+    fused_attention: bool = False,
     mplus_aug_variants: tuple[str, ...] = (),
     mplus_aug_train_images: Optional[set[str]] = None,
     cache_attention: bool = False,
@@ -1093,6 +1167,7 @@ def build_gate_embed_cache(
     paths_root = get_paths()
     tiles_index_path = tiles_index_path or (paths_root.manifests / "tiles_index.csv")
     cpaths = cache_paths or _cache_paths(paths_root.root)
+    _activate_embed_log_context(cpaths)
     fingerprint = _manifest_fingerprint(
         tiles_index_path,
         backbone_name,
@@ -1165,6 +1240,8 @@ def build_gate_embed_cache(
     aug_note = f" + {n_total - n:,} aug M+" if n_total > n else ""
     pool_note = "mean-pool DINO" if pooling_mode in {"none", ""} else f"pool={pooling_mode}"
     attn_note = f" + attn {attention_layers}" if attention_cfg is not None else ""
+    if fused_attention and attention_cfg is not None:
+        attn_note += " [fused 1-pass]"
     if attn_only:
         log.info(
             f"[Gate embed] Compilando SOLO atencion ViT {n_total:,} tiles "
@@ -1415,19 +1492,65 @@ def build_gate_embed_cache(
         )
         n_batches = max(1, len(uniform_batches))
 
+        prefetch_executor = None
+        prefetch_future = None
+        if image_arr is not None and cpu_decode_workers > 0 and n_batches > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            prefetch_executor = ThreadPoolExecutor(max_workers=1)
+
+        def _schedule_prefetch(batch_idx: int) -> None:
+            nonlocal prefetch_future
+            if prefetch_executor is None or batch_idx >= n_batches:
+                prefetch_future = None
+                return
+            _bi, _rowcols = uniform_batches[batch_idx]
+            prefetch_future = prefetch_executor.submit(
+                _prepare_embed_tile_batch,
+                image_arr=image_arr,
+                gimg=None,
+                rowcols=_rowcols,
+                device=device,
+                cpu_decode_workers=cpu_decode_workers,
+            )
+
+        _schedule_prefetch(0)
+
         for batch_num, (batch_indices, rowcols) in enumerate(uniform_batches, start=1):
             bs_try = len(rowcols)
             chunk_indices = list(batch_indices)
+            full_batch = True
             while True:
                 tiles = views = d0 = sal = feat = None
                 try:
                     sub_rowcols = rowcols[:bs_try]
                     sub_indices = chunk_indices[:bs_try]
-                    if image_arr is not None:
-                        tiles = _batch_tiles_cpu_to_gpu(image_arr, sub_rowcols, device)
+                    if prefetch_future is not None and full_batch and bs_try == len(rowcols):
+                        tiles = prefetch_future.result()
+                        prefetch_future = None
+                    elif image_arr is not None:
+                        tiles = _prepare_embed_tile_batch(
+                            image_arr=image_arr,
+                            gimg=None,
+                            rowcols=sub_rowcols,
+                            device=device,
+                            cpu_decode_workers=cpu_decode_workers,
+                        )
                     else:
                         assert gimg is not None
-                        tiles = batch_tiles_gpu(gimg, sub_rowcols)
+                        tiles = _prepare_embed_tile_batch(
+                            image_arr=None,
+                            gimg=gimg,
+                            rowcols=sub_rowcols,
+                            device=device,
+                        )
+                    if (
+                        prefetch_executor is not None
+                        and full_batch
+                        and bs_try == len(rowcols)
+                        and batch_num < n_batches
+                    ):
+                        _schedule_prefetch(batch_num)
                     label_slice = grp["stage1"].to_numpy()[sub_indices]
                     label_idx = torch.from_numpy(encode_gate_indices(label_slice)).to(device)
                     out = _forward_embed_batch(
@@ -1439,6 +1562,7 @@ def build_gate_embed_cache(
                         labels=label_idx,
                         u2net=u2net,
                         pooling_mode=pooling_mode,
+                        fused_attention=fused_attention,
                     )
                     if attention_cfg is None:
                         feat_np = out
@@ -1479,6 +1603,10 @@ def build_gate_embed_cache(
                     break
                 except torch.cuda.OutOfMemoryError:
                     release_cuda_memory(gc_collect=False)
+                    if prefetch_future is not None:
+                        prefetch_future.cancel()
+                        prefetch_future = None
+                    full_batch = False
                     if bs_try <= 1:
                         raise
                     bs_try = max(1, bs_try // 2)
@@ -1523,6 +1651,9 @@ def build_gate_embed_cache(
                     },
                 )
                 last_progress_t = now
+
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=False)
 
         if gimg is not None:
             del gimg

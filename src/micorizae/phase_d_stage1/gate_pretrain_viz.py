@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -11,9 +10,45 @@ import pandas as pd
 
 from ..common.logging_utils import get_logger
 from ..common.paths import get_paths
+from ..phase_b_tiling.jpeg_streaming import crop_tile_u8_from_file
 from .gate_classes import GATE_CLASS_NAMES
 
 log = get_logger("phase_d.gate_pretrain_viz")
+
+# Cache acotada: como mucho 2 panorámicas AM en RAM (~2–3 GB).
+_image_rgb_cache: dict[str, np.ndarray] = {}
+_IMAGE_CACHE_MAX = 2
+
+
+def _load_tile_rgb_u8(rec: pd.Series, paths_root: Path) -> np.ndarray | None:
+    """Recorte tile RGB uint8; evita DecompressionBomb PIL y loguea decode lento."""
+    img_path = paths_root / str(rec["image_path"])
+    if not img_path.exists():
+        return None
+    ts = int(rec["tile_size"]) if "tile_size" in rec else 252
+    row, col = int(rec["row"]), int(rec["col"])
+    key = str(img_path.resolve())
+    try:
+        if key not in _image_rgb_cache:
+            while len(_image_rgb_cache) >= _IMAGE_CACHE_MAX:
+                evict = next(iter(_image_rgb_cache))
+                del _image_rgb_cache[evict]
+            log.info(f"[Gate viz] decodificando JPEG {img_path.name} (puede tardar en panorámicas AM)...")
+            print(f"[Gate viz] decodificando {img_path.name}...", flush=True)
+        return crop_tile_u8_from_file(
+            img_path,
+            row,
+            col,
+            ts,
+            image_arr_cache=_image_rgb_cache,
+        )
+    except Exception as e:
+        log.debug(f"[Gate viz] tile load fail {img_path}: {e}")
+        return None
+
+
+def _clear_tile_viz_cache() -> None:
+    _image_rgb_cache.clear()
 
 
 def ensure_matplotlib_agg() -> None:
@@ -30,6 +65,42 @@ def legend_if_labeled(ax, **kwargs) -> None:
         ax.legend(**kwargs)
 
 
+def _sample_tiles_for_viz(
+    pool: pd.DataFrame,
+    n_per_class: int,
+    rng: np.random.Generator,
+    *,
+    max_unique_images: int = 4,
+) -> pd.DataFrame:
+    """Muestra tiles para PNG pretrain limitando JPEGs únicos (panorámicas AM son lentas)."""
+    if pool.empty or n_per_class <= 0:
+        return pool.iloc[:0]
+    imgs = pool["image_path"].astype(str).unique()
+    rng.shuffle(imgs)
+    chosen = list(imgs[: max(1, min(max_unique_images, len(imgs)))])
+    per_img = max(1, int(np.ceil(n_per_class / len(chosen))))
+    parts: list[pd.DataFrame] = []
+    for img in chosen:
+        if len(parts) >= n_per_class:
+            break
+        sub = pool[pool["image_path"].astype(str) == img]
+        need = min(per_img, n_per_class - sum(len(p) for p in parts), len(sub))
+        if need <= 0:
+            continue
+        idx = rng.choice(sub.index.to_numpy(), size=need, replace=len(sub) < need)
+        parts.append(sub.loc[idx])
+    if not parts:
+        return pool.iloc[:0]
+    out = pd.concat(parts, ignore_index=True)
+    if len(out) < n_per_class:
+        rest = pool.drop(out.index, errors="ignore")
+        if not rest.empty:
+            extra = min(n_per_class - len(out), len(rest))
+            idx = rng.choice(rest.index.to_numpy(), size=extra, replace=len(rest) < extra)
+            out = pd.concat([out, rest.loc[idx]], ignore_index=True)
+    return out.iloc[:n_per_class]
+
+
 def plot_tile_samples_by_class(
     tiles_df: pd.DataFrame,
     out_png: Path,
@@ -39,11 +110,10 @@ def plot_tile_samples_by_class(
     title: str = "Muestra tiles por clase (gold stage1)",
 ) -> Optional[Path]:
     """Grid PNG: n tiles aleatorios por clase, recorte JPEG desde manifest."""
-    from PIL import Image
-
     ensure_matplotlib_agg()
     import matplotlib.pyplot as plt
 
+    _clear_tile_viz_cache()
     required = {"image_path", "row", "col", "stage1"}
     if tiles_df.empty or not required.issubset(tiles_df.columns):
         log.warning("[Gate viz] plot_tile_samples: dataframe vacio o sin columnas requeridas")
@@ -71,8 +141,10 @@ def plot_tile_samples_by_class(
             axes[row_i, 0].set_ylabel(cls, fontsize=9)
             continue
         n = min(n_per_class, len(pool))
-        idx = rng.choice(pool.index.to_numpy(), size=n, replace=len(pool) < n)
-        sample = pool.loc[idx]
+        sample = _sample_tiles_for_viz(pool, n, rng)
+        # Ordenar por imagen: maximiza hits de cache y reduce thrashing RAM.
+        if not sample.empty and "image_path" in sample.columns:
+            sample = sample.sort_values("image_path").reset_index(drop=True)
 
         for col_i in range(n_per_class):
             ax = axes[row_i, col_i]
@@ -82,27 +154,18 @@ def plot_tile_samples_by_class(
             if col_i >= len(sample):
                 continue
             rec = sample.iloc[col_i]
-            ts = int(rec["tile_size"]) if "tile_size" in rec else 252
-            x0 = int(rec["col"]) * ts
-            y0 = int(rec["row"]) * ts
-            img_path = paths_root / str(rec["image_path"])
-            if not img_path.exists():
-                ax.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=7)
-                continue
-            try:
-                with Image.open(img_path) as im:
-                    im = im.convert("RGB")
-                    tile = im.crop((x0, y0, x0 + ts, y0 + ts))
-                    ax.imshow(np.asarray(tile))
-            except Exception as e:
-                ax.text(0.5, 0.5, "err", ha="center", va="center", fontsize=7)
-                log.debug(f"[Gate viz] tile crop fail {img_path}: {e}")
+            tile = _load_tile_rgb_u8(rec, paths_root)
+            if tile is None:
+                ax.text(0.5, 0.5, "missing" if not (paths_root / str(rec["image_path"])).exists() else "err", ha="center", va="center", fontsize=7)
+            else:
+                ax.imshow(tile)
 
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120)
     plt.close(fig)
+    _clear_tile_viz_cache()
     return out_png
 
 
@@ -148,11 +211,10 @@ def plot_tile_samples_annotated(
     manifest_csv: Optional[Path] = None,
 ) -> Optional[Path]:
     """Grid PNG con metadatos por tile + CSV manifest opcional."""
-    from PIL import Image
-
     ensure_matplotlib_agg()
     import matplotlib.pyplot as plt
 
+    _clear_tile_viz_cache()
     required = {"image_path", "row", "col", "stage1"}
     if tiles_df.empty or not required.issubset(tiles_df.columns):
         log.warning("[Gate viz] plot_tile_samples_annotated: dataframe vacio o sin columnas")
@@ -181,8 +243,10 @@ def plot_tile_samples_annotated(
             axes[row_i, 0].set_ylabel(cls, fontsize=9)
             continue
         n = min(n_per_class, len(pool))
-        idx = rng.choice(pool.index.to_numpy(), size=n, replace=len(pool) < n)
-        sample = pool.loc[idx]
+        sample = _sample_tiles_for_viz(pool, n, rng)
+        # Ordenar por imagen: maximiza hits de cache y reduce thrashing RAM.
+        if not sample.empty and "image_path" in sample.columns:
+            sample = sample.sort_values("image_path").reset_index(drop=True)
 
         for col_i in range(n_per_class):
             ax = axes[row_i, col_i]
@@ -193,21 +257,20 @@ def plot_tile_samples_annotated(
                 continue
             rec = sample.iloc[col_i]
             ts = int(rec["tile_size"]) if "tile_size" in rec else 252
-            x0 = int(rec["col"]) * ts
-            y0 = int(rec["row"]) * ts
             img_path = paths_root / str(rec["image_path"])
             caption = _format_tile_caption(rec, split=split, etapa=etapa)
-            if not img_path.exists():
-                ax.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=6)
+            tile = _load_tile_rgb_u8(rec, paths_root)
+            if tile is None:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "missing" if not img_path.exists() else "err",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                )
             else:
-                try:
-                    with Image.open(img_path) as im:
-                        im = im.convert("RGB")
-                        tile = im.crop((x0, y0, x0 + ts, y0 + ts))
-                        ax.imshow(np.asarray(tile))
-                except Exception as e:
-                    ax.text(0.5, 0.5, "err", ha="center", va="center", fontsize=6)
-                    log.debug(f"[Gate viz] tile crop fail {img_path}: {e}")
+                ax.imshow(tile)
             ax.set_title(caption, fontsize=6.5, pad=4, linespacing=1.15)
             manifest_rows.append(
                 {
@@ -228,6 +291,7 @@ def plot_tile_samples_annotated(
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=130, bbox_inches="tight")
     plt.close(fig)
+    _clear_tile_viz_cache()
 
     if manifest_csv is not None:
         manifest_csv.parent.mkdir(parents=True, exist_ok=True)

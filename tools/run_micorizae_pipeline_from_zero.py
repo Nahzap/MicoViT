@@ -118,6 +118,13 @@ def main() -> None:
             )
         )
 
+    ext_max = int(getattr(user_config, "GATE_AMFINDER_EXTERNAL_MAX_IMAGES", 0))
+    if bool(getattr(user_config, "GATE_AMFINDER_EXTERNAL_EVAL", False)):
+        ext_cmd = [str(PY), str(ROOT / "run.py"), "gate-am-external-eval"]
+        if ext_max > 0:
+            ext_cmd.extend(["--max-images", str(ext_max)])
+        plan.append((3, "validacion externa AMFinder post-Gate (Stage1)", ext_cmd))
+
     if args.wipe_stage2_h5:
         for name in ("stage2_pixel_mplus_v1.h5", "stage2_pixel_mplus_v1.meta.json", "stage2_pixel_mplus_v1.lookup.parquet"):
             (ROOT / "cache" / name).unlink(missing_ok=True)
@@ -128,24 +135,14 @@ def main() -> None:
     plan.append(
         (5, "train Stage2-Pixel ViT (+ posttrain auto si config)", [str(PY), str(ROOT / "run.py"), "train-stage2-pixel", "--epochs", str(stage2_epochs)])
     )
-    # Paso 6: redundante si STAGE2_PIXEL_POSTTRAIN_FULL_REPORT=True en train; útil para regenerar solo full-image
-    plan.append((6, "posttrain full-image (regenerar si hace falta)", []))
+    # Paso 6 omitido: train-stage2-pixel ya genera posttrain + full-image (6 val + 6 test).
+    # Usar manualmente si hace falta regenerar solo mapas:
+    #   python run.py stage2-pixel-posttrain-report --run-id <id> --force --fullimage
 
     current_step = 0
     for step_num, label, cmd in plan:
         if step_num < args.from_step:
             continue
-        if step_num == 6:
-            run_id = _latest_stage2_run_id(_gate_run_id())
-            cmd = [
-                str(PY),
-                str(ROOT / "run.py"),
-                "stage2-pixel-posttrain-report",
-                "--run-id",
-                run_id,
-                "--force",
-                "--fullimage",
-            ]
         if step_num != current_step:
             current_step = step_num
         print(f"[{step_num}/6] {label}", flush=True)

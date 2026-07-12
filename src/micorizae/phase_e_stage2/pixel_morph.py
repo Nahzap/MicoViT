@@ -3,25 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 import pandas as pd
 
-from ..phase_i_weakseg.pipeline import (
+from micorizae.morph_core import (
     CLASS_ARBUSCULE,
     CLASS_COLONY,
     CLASS_HYPHAE,
     CLASS_ROOT,
     CLASS_VESICLE,
     WeakSegParams,
-    consolidate_with_precedence,
-    render_overlay,
-    render_segmentation_color,
-    segment_tile,
-    smooth_seams,
 )
 from .pixel_class_map import (
     COLONY_CLASSES,
@@ -29,8 +23,6 @@ from .pixel_class_map import (
     NUM_PIXEL_CLASSES,
     PIXEL_CLASS_COLORS,
     PIXEL_CLASS_TO_IDX,
-    PIXEL_IDX_TO_CLASS,
-    PIXEL_IGNORE_INDEX,
 )
 
 # weakseg class id → pixel morph id (5 clases; ROOT weak → BG)
@@ -59,61 +51,28 @@ def weak_seg_to_pixel_map(weak_seg: np.ndarray) -> np.ndarray:
     return out
 
 
-def segment_tile_pixel_morph(tile_rgb: np.ndarray, params: Optional[PixelMorphParams] = None) -> np.ndarray:
+def segment_tile_pixel_morph(
+    tile_rgb: np.ndarray,
+    params: Optional[PixelMorphParams] = None,
+    *,
+    masks: Optional[dict[str, np.ndarray]] = None,
+    ambiguous_to_h_dense: bool = True,
+) -> np.ndarray:
     """Segmenta un tile RGB (H,W,3) uint8 → mapa píxel uint8 (5 clases).
 
-      - BG (0): fondo blanco y tejido sin tinción (no fúngico).
-      - IH/V/A: estructuras discretas (hifas, vesículas rellenas, arbúsculos).
-      - H: corteza colonizada con tinción (incluye azul denso/saturado, que es
-        colonización intensa, NO vesículas ni ruido).
-
-    En regiones de azul saturado se SUPRIMEN los seeds de estructura (blobs/crestas
-    espurios) y el área se etiqueta como H — colonización densa, no speckle.
+    Delega a ``morph_pipeline.compose`` (orquestador SRP). La detección de
+    cada clase vive solo en ``detectors.*`` vía ``segment_tile``.
     """
+    from .morph_pipeline import compose_pixel_map
+
     p = params or PixelMorphParams()
-    masks = segment_tile(tile_rgb, p.weak)
-    root = masks["root"] > 0
-    hyphae = masks["hyphae"] > 0
-    vesicle = masks["vesicle"] > 0
-    arbuscule = masks["arbuscule"] > 0
-    saturated = masks.get("ambiguous", None)
-    saturated = np.zeros_like(root) if saturated is None else saturated.astype(bool)
-
-    # Seeds espurios en azul saturado se descartan → esa zona quedará como H.
-    hyphae &= ~saturated
-    vesicle &= ~saturated
-    arbuscule &= ~saturated
-    structure = hyphae | vesicle | arbuscule
-
-    if "stain" in masks:
-        stain = masks["stain"]
-        thr = float(p.weak.stain_pctl)
-        root_vals = stain[root] if root.any() else stain.reshape(-1)
-        stain_thr = float(np.percentile(root_vals, thr)) if root_vals.size else 0.0
-        stained = (stain > max(stain_thr, 1e-3)) & root
-    else:
-        stained = root
-    # el azul saturado es colonización aunque quede bajo el percentil de tinción
-    stained = stained | (saturated & root)
-
-    seg = np.zeros(root.shape, dtype=np.uint8)  # BG (fondo + tejido sin tinción)
-    seg[stained & ~structure] = PIXEL_CLASS_TO_IDX["H"]  # corteza colonizada (incl. azul denso)
-    seg[hyphae] = PIXEL_CLASS_TO_IDX["IH"]               # precedencia A > V > IH
-    seg[vesicle] = PIXEL_CLASS_TO_IDX["V"]
-    seg[arbuscule] = PIXEL_CLASS_TO_IDX["A"]
-
-    if p.seam_sigma > 0:
-        seg = _smooth_pixel_seg(seg, sigma=p.seam_sigma)
-    return seg
-
-
-def _smooth_pixel_seg(seg: np.ndarray, sigma: float) -> np.ndarray:
-    probs = np.stack([(seg == i).astype(np.float32) for i in range(NUM_PIXEL_CLASSES)], axis=0)
-    from scipy.ndimage import gaussian_filter
-
-    for i in range(NUM_PIXEL_CLASSES):
-        probs[i] = gaussian_filter(probs[i], sigma=sigma)
-    return np.argmax(probs, axis=0).astype(np.uint8)
+    return compose_pixel_map(
+        tile_rgb,
+        weak=p.weak,
+        seam_sigma=float(p.seam_sigma),
+        masks=masks,
+        ambiguous_to_h_dense=ambiguous_to_h_dense,
+    )
 
 
 def _place_patch(canvas: np.ndarray, patch: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> None:

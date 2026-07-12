@@ -152,6 +152,55 @@ def extract_dino_cls_patch_attention(
     return torch.stack(maps, dim=1)
 
 
+@torch.inference_mode()
+def forward_dino_pooled_with_attention(
+    backbone: nn.Module,
+    x: torch.Tensor,
+    *,
+    cfg: DinoAttentionConfig,
+    dino_input_size: int = 252,
+    mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Un solo recorrido ViT: mean-pool embed + mapas CLS->patch (evita 2x forward)."""
+    from .backbones import DINOv2Backbone
+
+    dino = _unwrap_dino_model(backbone)
+    gh, gw = dino_patch_grid(dino_input_size)
+    n_patches = gh * gw
+    layer_set = set(cfg.layer_indices)
+    n_reg = int(getattr(dino, "num_register_tokens", 0) or 0)
+    patch_start = 1 + n_reg
+
+    x_tokens = dino.prepare_tokens_with_masks(x)
+    maps: list[torch.Tensor] = []
+
+    for i, blk in enumerate(dino.blocks):
+        x_norm = blk.norm1(x_tokens)
+        if i in layer_set:
+            attn = _attention_weights(blk.attn, x_norm.float())
+            cls_to_patch = attn[:, :, 0, patch_start : patch_start + n_patches]
+            if cls_to_patch.shape[-1] != n_patches:
+                raise RuntimeError(
+                    f"cls_to_patch shape {cls_to_patch.shape} != n_patches={n_patches}"
+                )
+            spatial = cls_to_patch.reshape(attn.size(0), attn.size(1), gh, gw)
+            if cfg.head_reduce == "mean":
+                spatial = spatial.mean(dim=1)
+            maps.append(spatial)
+        x_tokens = blk(x_tokens)
+
+    x_tokens = dino.norm(x_tokens)
+    patch_tokens = x_tokens[:, patch_start : patch_start + n_patches, :]
+    if isinstance(backbone, DINOv2Backbone):
+        feat = backbone._pool_patch_tokens(patch_tokens, x, mask)
+    else:
+        feat = patch_tokens.mean(dim=1)
+
+    if len(maps) != cfg.num_layers:
+        raise RuntimeError(f"capas extraidas {len(maps)} != esperado {cfg.num_layers}")
+    return feat, torch.stack(maps, dim=1)
+
+
 def attention_maps_to_numpy(maps: torch.Tensor) -> np.ndarray:
     """(B, ...) float32 -> (B, ...) float16 numpy."""
     return maps.detach().float().cpu().numpy().astype(np.float16)

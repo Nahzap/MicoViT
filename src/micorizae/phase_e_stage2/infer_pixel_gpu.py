@@ -273,6 +273,9 @@ def _infer_image_pixel_morph_core(
 
     h, w = img_np.shape[:2]
     full_seg = stitch_pixel_map_from_tiles((h, w), sub, tile_segments)
+    from .instance_merge import merge_vesicle_instances
+
+    full_seg = merge_vesicle_instances(full_seg, min_area=30, circularity_min=0.65)
     tile_table = quantize_tiles_table(sub, tile_segments)
     return PixelMorphInferResult(
         seg_map=full_seg,

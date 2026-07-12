@@ -63,6 +63,48 @@ def _batch_tiles_pyvips(
     return torch.from_numpy(stacked).permute(0, 3, 1, 2).to(device, non_blocking=True)
 
 
+def crop_tile_u8_from_file(
+    image_path: Path,
+    row: int,
+    col: int,
+    tile_size: int,
+    *,
+    pad_value: int = 255,
+    image_arr_cache: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Un tile RGB uint8 desde disco. pyvips=crop sin decode completo; si no, cv2+PIL cache."""
+    x0 = col * tile_size
+    y0 = row * tile_size
+    try:
+        import pyvips
+
+        img = pyvips.Image.new_from_file(str(image_path), access="sequential")
+        w, h = img.width, img.height
+        cw = min(tile_size, max(0, w - x0))
+        ch = min(tile_size, max(0, h - y0))
+        if cw <= 0 or ch <= 0:
+            raise ValueError(f"crop fuera de bounds {image_path.name} r{row}c{col}")
+        region = img.crop(x0, y0, cw, ch)
+        arr = np.ndarray(
+            buffer=region.write_to_memory(),
+            dtype=np.uint8,
+            shape=(ch, cw, region.bands),
+        )
+        if region.bands == 4:
+            arr = arr[:, :, :3]
+        return _pad_tile_u8(arr, tile_size, pad_value)
+    except (ImportError, OSError, AttributeError, ValueError):
+        pass
+
+    cache = image_arr_cache if image_arr_cache is not None else {}
+    key = str(image_path.resolve())
+    if key not in cache:
+        cache[key] = open_image_rgb_fast(image_path)
+    return crop_tile_from_array(
+        cache[key], row=row, col=col, tile_size=tile_size, pad_value=pad_value
+    )
+
+
 def batch_tiles_streaming_from_file(
     image_path: Path,
     rowcols: list[tuple[int, int, int]],

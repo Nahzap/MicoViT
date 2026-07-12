@@ -1064,6 +1064,70 @@ def recover_gate_am_run_report(
     return report_md
 
 
+def run_gate_am_external_eval(
+    *,
+    run_id: str | None = None,
+    max_images: int | None = None,
+    force_rebuild: bool = False,
+    skip_maps: bool = False,
+    cfg: Any = None,
+) -> dict[str, Any]:
+    """Validacion externa AMFinder post-Gate (Stage1). Obligatoria antes de Stage2."""
+    import torch
+
+    from .common.paths import get_paths
+    from .common.run_outputs import RunOutputs
+    from .gate_external_eval import print_external_validation_banner, run_amfinder_external_eval
+    from .phase_d_stage1.gate_tile_dino import CHECKPOINT_NAME
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA no disponible para validacion externa AMFinder.")
+
+    try:
+        import config as user_config  # type: ignore
+
+        cfg = cfg or user_config
+    except Exception:
+        cfg = type("Cfg", (), {})()
+
+    paths = get_paths()
+    ckpt_dir = paths.root / "models" / "checkpoints" / "gate_am"
+    ckpt_path = ckpt_dir / CHECKPOINT_NAME
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Falta checkpoint Gate: {ckpt_path}")
+
+    run_id = _resolve_gate_run_id(ckpt_dir, run_id)
+    run = RunOutputs.open(run_id)
+    params = gate_train_params_from_config(cfg)
+    include_unknown = bool(params.gate4.include_unknown_in_split) if params.gate4 else False
+    _train_df, _val_df, external_df, _info, _cache_tiles = resolve_gate_am_splits(
+        cfg,
+        exclude_unreadable=not include_unknown,
+    )
+    if external_df.empty:
+        raise RuntimeError("Sin tiles amfinder_external en splits; no hay holdout externo.")
+
+    max_im = int(max_images if max_images is not None else _cfg(cfg, "GATE_AMFINDER_EXTERNAL_MAX_IMAGES", 0))
+    print_external_validation_banner(
+        n_tiles=len(external_df),
+        phase="inicio",
+    )
+    log.info(
+        f"[Gate AM] Validacion externa AMFinder run={run_id} max_images={max_im} "
+        f"force_rebuild={force_rebuild}"
+    )
+    return run_amfinder_external_eval(
+        external_df=external_df,
+        run_dir=run.root,
+        ckpt_dir=ckpt_dir,
+        cfg=cfg,
+        batch_size=params.batch_size,
+        skip_maps=skip_maps,
+        max_images=max_im,
+        force_rebuild=force_rebuild,
+    )
+
+
 def execute_train_gate_am(
     params: GateTrainParams,
     *,
@@ -1492,21 +1556,22 @@ def execute_train_gate_am(
             device=device,
         )
         if bool(_cfg(cfg, "GATE_AMFINDER_EXTERNAL_EVAL", False)) and not external_df.empty:
-            from .gate_external_eval import run_amfinder_external_eval
+            from .gate_external_eval import print_external_validation_banner, run_amfinder_external_eval
 
+            print_external_validation_banner(n_tiles=len(external_df), phase="inicio")
             log.info(
-                f"[Gate AM] Eval externa AMFinder ({len(external_df):,} tiles)..."
+                f"[Gate AM] Post-train: {len(external_df):,} tiles — "
+                "validacion externa AMFinder (no Stage2; ver banner terminal)"
             )
-            try:
-                run_amfinder_external_eval(
-                    external_df=external_df,
-                    run_dir=run.root,
-                    ckpt_dir=ckpt_dir,
-                    cfg=cfg,
-                    batch_size=params.batch_size,
-                )
-            except Exception:
-                log.exception("[Gate AM] Eval externa AMFinder fallo")
+            max_ext = int(_cfg(cfg, "GATE_AMFINDER_EXTERNAL_MAX_IMAGES", 0))
+            run_amfinder_external_eval(
+                external_df=external_df,
+                run_dir=run.root,
+                ckpt_dir=ckpt_dir,
+                cfg=cfg,
+                batch_size=params.batch_size,
+                max_images=max_ext,
+            )
     except Exception:
         log.exception(
             f"[Gate AM] Finalize fallo (artefactos parciales en {run.root}). "

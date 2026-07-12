@@ -1,4 +1,8 @@
-"""Streaming de tiles imagen-por-imagen.
+"""DEPRECATED / QUARANTINE — legacy ImageWindowDataset streaming.
+
+Production tiling uses ``jpeg_streaming``. Do not use for new work.
+
+Streaming de tiles imagen-por-imagen.
 
 Filosofía (recordatorio del usuario):
     "pequeñas ventanas de observación, recorriendo todo el lienzo".
@@ -32,6 +36,15 @@ from ..common.paths import get_paths
 from .tile_cutter import crop_tile_from_array, open_image_rgb
 
 log = get_logger("phase_b.streaming")
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+
+def _normalize_imagenet(arr: np.ndarray) -> torch.Tensor:
+    """uint8 HWC numpy -> float32 CHW ImageNet-normalized tensor."""
+    x = torch.from_numpy(np.asarray(arr, dtype=np.uint8)).permute(2, 0, 1).float() / 255.0
+    return (x - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
 def plan_image_order(
@@ -110,7 +123,6 @@ def iter_tiles_for_image(
     salir mediante `gc.collect()` explícito en el `finally`.
     """
     from ..phase_c_views.transforms import build_views
-    from ..phase_d_stage1.datasets import _normalize_imagenet
 
     image_arr = open_image_rgb(image_path)
     try:

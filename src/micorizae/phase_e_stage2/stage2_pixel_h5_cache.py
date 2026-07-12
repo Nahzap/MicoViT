@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
@@ -16,6 +17,7 @@ from typing import Iterator, Optional
 import numpy as np
 import pandas as pd
 import torch
+from concurrent.futures import Future
 
 from ..common.logging_utils import get_logger
 from ..common.paths import get_paths
@@ -42,7 +44,45 @@ def _default_h5_workers(workers: Optional[int] = None) -> int:
 
     if workers is not None and int(workers) > 0:
         return int(workers)
-    return max(1, min(12, (os.cpu_count() or 4) - 2))
+    return max(1, min(14, (os.cpu_count() or 4) - 1))
+
+
+def _run_cpu_map(pool, fn, tiles_hwc: list[np.ndarray], n_workers: int) -> list:
+    """map en pool compartido (sin crear ThreadPool por batch)."""
+    chunksize = max(1, len(tiles_hwc) // max(1, n_workers))
+    return list(pool.map(fn, tiles_hwc, chunksize=chunksize))
+
+
+def _run_cpu_pack_process(cpu_pool, tiles_hwc: list[np.ndarray]) -> list:
+    """ProcessPool: un tile por tarea para balancear carga entre procesos."""
+    from . import stage2_h5_cpu_pack as cpu_pack
+
+    return list(cpu_pool.map(cpu_pack.pack_one, tiles_hwc, chunksize=1))
+
+
+def _write_h5_batch(
+    hf,
+    *,
+    write_idx: int,
+    rgb_np: np.ndarray,
+    packs: list,
+    store_priors: bool,
+) -> int:
+    b = int(rgb_np.shape[0])
+    if len(packs) != b:
+        raise RuntimeError(f"[Stage2-Pixel H5] pack/rgb mismatch: {len(packs)} vs {b}")
+    remaining = int(hf["rgb"].shape[0]) - write_idx
+    if b > remaining:
+        raise RuntimeError(
+            f"[Stage2-Pixel H5] overflow: write_idx={write_idx} batch={b} remaining={remaining}"
+        )
+    labels_np = np.stack([p[0] for p in packs], axis=0)
+    hf["rgb"][write_idx : write_idx + b] = rgb_np
+    hf["label"][write_idx : write_idx + b] = labels_np
+    if store_priors:
+        hf["prior_evidence"][write_idx : write_idx + b] = np.stack([p[1] for p in packs], axis=0)
+        hf["prior_vesicle"][write_idx : write_idx + b] = np.stack([p[2] for p in packs], axis=0)
+    return write_idx + b
 
 
 def _pin_blas_single_thread() -> None:
@@ -71,6 +111,12 @@ def _manifest_fingerprint(tiles_index_path: Path) -> str:
 
 def _morph_fingerprint(morph: PixelMorphParams, input_size: int, gate_run_id: str) -> str:
     w = morph.weak
+    try:
+        import config as user_config
+
+        pseudo_gt = str(getattr(user_config, "STAGE2_PIXEL_PSEUDO_GT_VERSION", "v2_atlas_arb"))
+    except Exception:
+        pseudo_gt = "v2_atlas_arb"
     payload = {
         "input_size": input_size,
         "gate_run_id": gate_run_id,
@@ -79,6 +125,9 @@ def _morph_fingerprint(morph: PixelMorphParams, input_size: int, gate_run_id: st
         "frangi_pctl": float(w.frangi_pctl),
         "arbuscule_pctl": float(w.arbuscule_pctl),
         "ves_bg_max": float(getattr(w, "ves_bg_max", 0.5)),
+        "ves_max_radius": int(getattr(w, "ves_max_radius", 0)),
+        "ves_max_sigma": float(getattr(w, "ves_max_sigma", 40.0)),
+        "pseudo_gt_version": pseudo_gt,
         "seam_sigma": float(morph.seam_sigma),
         "class_schema": "5c_bg_ih_v_a_h_stain",
     }
@@ -131,13 +180,39 @@ def cache_is_valid(
         return False
 
 
-def _weak_label_tile_u8(tile_u8: np.ndarray, params: PixelMorphParams, target_size: int) -> np.ndarray:
-    seg = segment_tile_pixel_morph(tile_u8, params)
+def _weak_label_tile_u8(
+    tile_u8: np.ndarray,
+    params: PixelMorphParams,
+    target_size: int,
+    *,
+    masks: Optional[dict[str, np.ndarray]] = None,
+) -> np.ndarray:
+    seg = segment_tile_pixel_morph(tile_u8, params, masks=masks)
     if seg.shape[0] != target_size or seg.shape[1] != target_size:
         import cv2
 
         seg = cv2.resize(seg, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
     return seg.astype(np.uint8)
+
+
+def _resize_prior_maps_to_input(
+    ev: np.ndarray, ves: np.ndarray, input_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Alinea priors al mismo ``input_size`` que rgb/label en HDF5 (p. ej. 224)."""
+    h, w = int(ev.shape[-2]), int(ev.shape[-1])
+    if h == input_size and w == input_size:
+        return ev, ves
+    import cv2
+
+    ev_out = np.stack(
+        [
+            cv2.resize(ev[c], (input_size, input_size), interpolation=cv2.INTER_LINEAR)
+            for c in range(ev.shape[0])
+        ],
+        axis=0,
+    )
+    ves_out = cv2.resize(ves, (input_size, input_size), interpolation=cv2.INTER_LINEAR)
+    return ev_out, ves_out
 
 
 def _build_tile_cpu_pack(
@@ -147,12 +222,15 @@ def _build_tile_cpu_pack(
     *,
     with_priors: bool,
 ) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    label = _weak_label_tile_u8(tile_hwc_u8, morph_params, input_size)
-    if not with_priors:
-        return label, None, None
+    from micorizae.morph_core import segment_tile
     from .pixel_prior_maps import compute_prior_training_targets
 
-    ev, ves = compute_prior_training_targets(tile_hwc_u8, morph_params)
+    masks = segment_tile(tile_hwc_u8, morph_params.weak)
+    label = _weak_label_tile_u8(tile_hwc_u8, morph_params, input_size, masks=masks)
+    if not with_priors:
+        return label, None, None
+    ev, ves = compute_prior_training_targets(tile_hwc_u8, morph_params, masks=masks)
+    ev, ves = _resize_prior_maps_to_input(ev, ves, input_size)
     return label, ev.astype(np.float16), ves.astype(np.float16)
 
 
@@ -300,11 +378,13 @@ def build_stage2_pixel_h5_cache(
     tiles_index_path: Optional[Path] = None,
     workers: Optional[int] = None,
     store_priors: bool = False,
+    max_inflight: int = 4,
 ) -> Path:
     """Materializa tiles M+ → HDF5 (rgb fp16 + label uint8 [+ priors si store_priors])."""
     import h5py
-    from concurrent.futures import ThreadPoolExecutor
-    from functools import partial
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    from . import stage2_h5_cpu_pack as cpu_pack
 
     paths = get_paths()
     tiles_index_path = tiles_index_path or (paths.manifests / "tiles_index.csv")
@@ -333,17 +413,21 @@ def build_stage2_pixel_h5_cache(
 
     _pin_blas_single_thread()
     n_workers = _default_h5_workers(workers)
+    inflight = max(2, int(max_inflight))
     comp = None if (compression or "").lower() in {"", "none", "off"} else compression
-    est_gb = n * (np.prod(RGB_SHAPE) * 2 + np.prod(LABEL_SHAPE)) / (1024**3)
+    est_gb = n * (float(np.prod(RGB_SHAPE)) * 2 + float(np.prod(LABEL_SHAPE))) / (1024**3)
     if store_priors:
-        est_gb += n * (np.prod(PRIOR_EVIDENCE_SHAPE) * 2 + np.prod(PRIOR_VESICLE_SHAPE) * 2) / (1024**3)
+        est_gb += n * (
+            float(np.prod(PRIOR_EVIDENCE_SHAPE)) * 2 + float(np.prod(PRIOR_VESICLE_SHAPE)) * 2
+        ) / (1024**3)
     log.info(
         f"[Stage2-Pixel H5] Conformando {n:,} tiles M+ -> {h5_path} "
         f"(rgb+label{'+priors' if store_priors else ''}, {n_workers} workers, comp={comp or 'none'}, ~{est_gb:.2f} GB)"
     )
     print(
-        f"[Stage2-Pixel H5] Conformando {n:,} tiles ({n_workers} workers CPU, weak"
-        f"{' + priors v3' if store_priors else ''}, sin ViT/U2Net)...",
+        f"[Stage2-Pixel H5] Conformando {n:,} tiles ({n_workers} procesos CPU, "
+        f"batch={batch_size}, inflight={inflight}, weak"
+        f"{' + priors v4' if store_priors else ''}, sin ViT/U2Net)...",
         flush=True,
     )
 
@@ -354,12 +438,7 @@ def build_stage2_pixel_h5_cache(
     root = paths.root
     groups = list(df.groupby("image_path", sort=False))
     n_images = len(groups)
-    cpu_fn = partial(
-        _build_tile_cpu_pack,
-        morph_params=morph_params,
-        input_size=input_size,
-        with_priors=store_priors,
-    )
+    use_process_pool = n_workers > 1
 
     with h5py.File(h5_path, "w") as hf:
         hf.create_dataset(
@@ -394,54 +473,90 @@ def build_stage2_pixel_h5_cache(
             hf.attrs["prior_morph_fingerprint"] = prior_fp
             hf.attrs["prior_classes"] = list(["BG", "IH", "V", "A", "H"])
 
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        pool_ctx: ProcessPoolExecutor | ThreadPoolExecutor | None
+        if use_process_pool:
+            pool_ctx = ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=cpu_pack.init_worker,
+                initargs=(morph_params, input_size, store_priors),
+            )
+        else:
+            cpu_pack.init_worker(morph_params, input_size, store_priors)
+            pool_ctx = None
+
+        with pool_ctx if use_process_pool else ThreadPoolExecutor(max_workers=1) as cpu_pool, ThreadPoolExecutor(
+            max_workers=max(6, inflight + 2)
+        ) as overlap_pool:
+            pending: deque[tuple[np.ndarray, Future]] = deque()
+            last_log_t = t0
+            current_img = ""
+
+            def _flush_pending() -> None:
+                nonlocal write_idx, last_log_t
+                if not pending:
+                    return
+                rgb_w, fut_w = pending.popleft()
+                packs = fut_w.result()
+                write_idx = _write_h5_batch(
+                    hf,
+                    write_idx=write_idx,
+                    rgb_np=rgb_w,
+                    packs=packs,
+                    store_priors=store_priors,
+                )
+                now = time.perf_counter()
+                if write_idx <= batch_size or (now - last_log_t) >= 3.0:
+                    elapsed = max(0.001, now - t0)
+                    rate = write_idx / elapsed
+                    eta = (n - write_idx) / max(rate, 0.001)
+                    print(
+                        f"[Stage2-Pixel H5] {100.0 * write_idx / n:.1f}% | "
+                        f"{write_idx:,}/{n:,} tiles | {rate:.1f} tiles/s | "
+                        f"ETA {eta / 60:.1f}m | inflight={len(pending)} | {current_img}",
+                        flush=True,
+                    )
+                    last_log_t = now
+
             for img_idx, (img_rel, sub) in enumerate(groups, start=1):
                 img_path = root / img_rel
                 if not img_path.exists():
                     raise FileNotFoundError(f"[Stage2-Pixel H5] imagen ausente: {img_path}")
+                current_img = Path(img_rel).name
+                print(
+                    f"[Stage2-Pixel H5] img {img_idx}/{n_images} decode GPU: {Path(img_rel).name} "
+                    f"({len(sub):,} tiles, procs={n_workers}, batch={batch_size}, inflight={inflight})",
+                    flush=True,
+                )
                 gimg = decode_jpeg_gpu(img_path, device=device)
                 sub = sub.sort_values(["row", "col"]).reset_index(drop=True)
                 coords = list(zip(sub["row"].astype(int), sub["col"].astype(int)))
                 ts = int(sub["tile_size"].iloc[0]) if "tile_size" in sub.columns else 252
 
-                for chunk_start in range(0, len(coords), batch_size):
-                    chunk = coords[chunk_start : chunk_start + batch_size]
+                chunk_coords = [
+                    coords[i : i + batch_size] for i in range(0, len(coords), batch_size)
+                ]
+                for chunk in chunk_coords:
                     rowcols = [(int(r), int(c), ts) for r, c in chunk]
                     tiles = batch_tiles_gpu(gimg, rowcols)
-                    tiles_u8 = torch.stack([tiles[j].cpu() for j in range(len(chunk))], dim=0)
-                    rgb_t = rgb_view_gpu(tiles_u8, target_size=input_size, normalize_imagenet=True)
+                    rgb_t = rgb_view_gpu(tiles, target_size=input_size, normalize_imagenet=True)
                     rgb_np = rgb_t.cpu().numpy().astype(np.float16)
+                    tiles_np = tiles.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+                    tiles_hwc = [tiles_np[j] for j in range(tiles_np.shape[0])]
 
-                    tiles_hwc = [
-                        tiles_u8[j].permute(1, 2, 0).contiguous().numpy() for j in range(len(chunk))
-                    ]
-                    packs = list(pool.map(cpu_fn, tiles_hwc))
-                    labels_np = np.stack([p[0] for p in packs], axis=0)
-                    b = len(chunk)
-                    hf["rgb"][write_idx : write_idx + b] = rgb_np
-                    hf["label"][write_idx : write_idx + b] = labels_np
-                    if store_priors:
-                        hf["prior_evidence"][write_idx : write_idx + b] = np.stack(
-                            [p[1] for p in packs], axis=0
-                        )
-                        hf["prior_vesicle"][write_idx : write_idx + b] = np.stack(
-                            [p[2] for p in packs], axis=0
-                        )
-                    write_idx += b
+                    if use_process_pool:
+                        fut = overlap_pool.submit(_run_cpu_pack_process, cpu_pool, tiles_hwc)
+                    else:
+                        fut = overlap_pool.submit(cpu_pack.pack_batch, tiles_hwc)
+                    pending.append((rgb_np, fut))
 
-                    if write_idx == b or write_idx % 40 == 0:
-                        elapsed = max(0.001, time.perf_counter() - t0)
-                        rate = write_idx / elapsed
-                        eta = (n - write_idx) / rate if rate > 0 else 0
-                        print(
-                            f"[Stage2-Pixel H5] {100.0 * write_idx / n:.1f}% | "
-                            f"{write_idx:,}/{n:,} tiles | {rate:.1f} tiles/s | "
-                            f"ETA {eta / 60:.1f}m | img {img_idx}/{n_images} {Path(img_rel).name}",
-                            flush=True,
-                        )
+                    while len(pending) >= inflight:
+                        _flush_pending()
 
                 del gimg
                 torch.cuda.empty_cache()
+
+            while pending:
+                _flush_pending()
 
     if write_idx != n:
         raise RuntimeError(f"[Stage2-Pixel H5] escrito {write_idx} tiles, esperado {n}")
@@ -664,6 +779,7 @@ def ensure_stage2_pixel_h5_cache(
     force_rebuild: bool = False,
     store_priors: bool = True,
     workers: Optional[int] = None,
+    max_inflight: int = 4,
 ) -> Stage2PixelH5Store:
     paths = get_paths()
     h5_path, meta_path, lookup_path = _cache_paths(paths.root)
@@ -681,6 +797,7 @@ def ensure_stage2_pixel_h5_cache(
         compression=compression,
         workers=workers,
         store_priors=store_priors,
+        max_inflight=max_inflight,
     )
     if store_priors:
         ensure_h5_prior_datasets(

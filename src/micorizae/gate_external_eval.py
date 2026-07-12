@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from .common.io import write_table
@@ -39,6 +40,101 @@ from .phase_d_stage1.gate_training_protocol import (
 log = get_logger("gate_external_eval")
 
 EXTERNAL_CACHE_BASENAME = "gate_amfinder_external_v1"
+EXTERNAL_VALIDATION_LABEL = "VALIDACION EXTERNA AMFinder"
+
+
+def external_cache_basename(max_images: int = 0) -> str:
+    """Cache separado por subconjunto (evita mezclar embed 29 imgs vs 10 imgs)."""
+    if max_images and int(max_images) > 0:
+        return f"gate_amfinder_external_n{int(max_images)}_v1"
+    return EXTERNAL_CACHE_BASENAME
+
+
+def limit_external_validation_df(
+    external_df: pd.DataFrame,
+    max_images: int,
+    *,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Subconjunto reproducible de imagenes AMFinder external (p. ej. 10/29)."""
+    if external_df.empty or max_images <= 0:
+        return external_df
+    imgs = sorted(external_df["image_path"].astype(str).unique())
+    if len(imgs) <= max_images:
+        return external_df.copy()
+
+    rng = np.random.default_rng(seed)
+    by_edge: dict[int, list[str]] = {}
+    for img in imgs:
+        sub = external_df[external_df["image_path"].astype(str) == img]
+        edge = int(sub["tile_edge"].iloc[0]) if "tile_edge" in sub.columns else int(sub["tile_size"].iloc[0])
+        by_edge.setdefault(edge, []).append(img)
+
+    chosen: list[str] = []
+    for edge in sorted(by_edge.keys()):
+        pool = sorted(by_edge[edge])
+        rng.shuffle(pool)
+        for img in pool:
+            if len(chosen) >= max_images:
+                break
+            chosen.append(img)
+        if len(chosen) >= max_images:
+            break
+    if len(chosen) < max_images:
+        for img in imgs:
+            if img not in chosen:
+                chosen.append(img)
+            if len(chosen) >= max_images:
+                break
+
+    out = external_df[external_df["image_path"].astype(str).isin(chosen)].copy()
+    log.info(
+        f"[External | {EXTERNAL_VALIDATION_LABEL}] Subconjunto {len(chosen)}/{len(imgs)} imagenes, "
+        f"{len(out):,} tiles (max_images={max_images})"
+    )
+    print(
+        f"[Gate AM | {EXTERNAL_VALIDATION_LABEL}] Subconjunto {len(chosen)}/{len(imgs)} imagenes, "
+        f"{len(out):,} tiles",
+        flush=True,
+    )
+    return out
+
+
+def print_external_validation_banner(
+    *,
+    n_tiles: int | None = None,
+    n_images: int | None = None,
+    n_images_total: int | None = None,
+    phase: str = "inicio",
+) -> None:
+    """Banner explícito en terminal: benchmark externo post-Gate, no Stage2 ni re-train."""
+    lines = [
+        "",
+        "=" * 88,
+        f"[Gate AM] {EXTERNAL_VALIDATION_LABEL} - holdout bloqueado (dominio distinto al train AM nativo)",
+        "  - NO es Stage2-Pixel (ViT segmentador IH/V/A/H).",
+        "  - NO re-entrena Gate: evalua el checkpoint Gate ya guardado.",
+    ]
+    if n_tiles is not None:
+        lines.append(f"  - Tiles holdout externo: {n_tiles:,}")
+    if n_images is not None and n_images_total is not None and n_images < n_images_total:
+        lines.append(f"  - Imagenes: {n_images}/{n_images_total} (subconjunto configurado)")
+    elif n_images is not None:
+        lines.append(f"  - Imagenes: {n_images}")
+    if phase == "embed":
+        lines.append(
+            "  - Fase actual: compilar embeddings DINO auxiliares (cache dedicado n10 si aplica)"
+        )
+    elif phase == "eval":
+        lines.append("  - Fase actual: inferencia probe Gate + metricas -> run/.../external/")
+    else:
+        lines.append("  - Fases: (1) embed DINO auxiliar  (2) eval probe  (3) reporte external/")
+    lines.append("  - Desactivar en config: GATE_AMFINDER_EXTERNAL_EVAL=False")
+    lines.append("  - Limite imagenes: GATE_AMFINDER_EXTERNAL_MAX_IMAGES (0=todas)")
+    lines.append("=" * 88)
+    msg = "\n".join(lines)
+    print(msg, flush=True)
+    log.info(msg.replace("\n", " "))
 
 
 def _ensure_external_cache(
@@ -47,6 +143,7 @@ def _ensure_external_cache(
     *,
     cfg: Any,
     force_rebuild: bool = False,
+    cache_basename: str | None = None,
 ) -> GateEmbedStore:
     import torch
 
@@ -54,15 +151,25 @@ def _ensure_external_cache(
         raise RuntimeError("CUDA no disponible para cache externa AMFinder.")
 
     paths = get_paths()
-    cpaths = cache_paths_with_basename(paths.root, EXTERNAL_CACHE_BASENAME)
+    basename = cache_basename or EXTERNAL_CACHE_BASENAME
+    cpaths = cache_paths_with_basename(paths.root, basename)
     if not force_rebuild and cpaths.meta.exists():
         try:
             store = GateEmbedStore(cpaths)
             store.indices_for_sub(external_df)
+            log.info(
+                f"[External | {EXTERNAL_VALIDATION_LABEL}] CACHE HIT embeddings auxiliares -> {cpaths.embed.name}"
+            )
+            print(
+                f"[Gate AM | {EXTERNAL_VALIDATION_LABEL}] CACHE HIT embed auxiliar "
+                f"({cpaths.embed.name}) — sin recompilar DINO",
+                flush=True,
+            )
             return store
         except KeyError:
-            log.info("[External] Cache incompleta; recompilando...")
+            log.info(f"[External | {EXTERNAL_VALIDATION_LABEL}] Cache incompleta; recompilando embed auxiliar...")
 
+    print_external_validation_banner(n_tiles=len(external_df), phase="embed")
     device = torch.device("cuda")
     backbone = build_branch_a(
         backbone_name=str(getattr(cfg, "GATE_BACKBONE", "dinov2_vits14")),
@@ -76,16 +183,20 @@ def _ensure_external_cache(
         backbone_name=str(getattr(cfg, "GATE_BACKBONE", "dinov2_vits14")),
         dino_input_size=int(getattr(cfg, "GATE_DINO_INPUT_SIZE", 280)),
         seg_target_size=int(getattr(cfg, "GATE_SEG_TARGET_SIZE", 400)),
-        batch_size=int(getattr(cfg, "GATE_CACHE_BATCH_SIZE", 20)),
+        batch_size=int(getattr(cfg, "GATE_AMFINDER_EXTERNAL_CACHE_BATCH_SIZE", 48)),
         tiles_index_path=tiles_index_path,
         cache_paths=cpaths,
         force_rebuild=force_rebuild,
         dynamic_batch=bool(getattr(cfg, "GATE_CACHE_DYNAMIC_BATCH", True)),
-        vram_budget_mb=float(getattr(cfg, "GATE_CACHE_VRAM_BUDGET_MB", 7500.0)),
+        vram_budget_mb=float(getattr(cfg, "GATE_AMFINDER_EXTERNAL_VRAM_BUDGET_MB", 7600.0)),
         cpu_decode_above_mb=float(getattr(cfg, "GATE_CACHE_CPU_DECODE_ABOVE_MB", 500.0)),
         empty_cache_every_n_batches=int(getattr(cfg, "GATE_CACHE_EMPTY_CACHE_EVERY_N_BATCHES", 0)),
         gc_collect_every_n_batches=int(getattr(cfg, "GATE_CACHE_GC_COLLECT_EVERY_N_BATCHES", 0)),
-        memmap_flush_every_n_images=int(getattr(cfg, "GATE_CACHE_MEMMAP_FLUSH_EVERY_N_IMAGES", 5)),
+        memmap_flush_every_n_images=int(
+            getattr(cfg, "GATE_AMFINDER_EXTERNAL_MEMMAP_FLUSH_EVERY_N_IMAGES", 10)
+        ),
+        cpu_decode_workers=int(getattr(cfg, "GATE_AMFINDER_EXTERNAL_CPU_DECODE_WORKERS", 4)),
+        fused_attention=bool(getattr(cfg, "GATE_AMFINDER_EXTERNAL_FUSED_ATTENTION", True)),
         mplus_aug_variants=(),
         cache_attention=bool(getattr(cfg, "GATE_CACHE_ATTENTION", False)),
         attention_layers=str(getattr(cfg, "GATE_CACHE_ATTENTION_LAYERS", "all")),
@@ -103,15 +214,29 @@ def run_amfinder_external_eval(
     batch_size: int = 48,
     skip_maps: bool = False,
     downscale: int = 4,
+    max_images: int = 0,
+    force_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Evalua holdout amfinder_external y escribe artefactos bajo run_dir/external/."""
     import torch
     from sklearn.metrics import classification_report
 
+    n_images_total = int(external_df["image_path"].nunique()) if not external_df.empty else 0
+    if max_images > 0:
+        external_df = limit_external_validation_df(external_df, max_images)
+    n_images = int(external_df["image_path"].nunique()) if not external_df.empty else 0
+    cache_bn = external_cache_basename(max_images if max_images > 0 else 0)
+
     if external_df.empty:
-        log.warning("[External] Sin tiles external_test; omitiendo eval.")
+        log.warning(f"[External | {EXTERNAL_VALIDATION_LABEL}] Sin tiles external_test; omitiendo eval.")
         return {}
 
+    print_external_validation_banner(
+        n_tiles=len(external_df),
+        n_images=n_images,
+        n_images_total=n_images_total,
+        phase="eval",
+    )
     paths = get_paths()
     ext_root = run_dir / "external"
     maps_dir = ext_root / "maps"
@@ -129,7 +254,13 @@ def run_amfinder_external_eval(
     ext_df = attach_domain_buckets(ext_df)
 
     tiles_index_path = write_table(ext_df, paths.manifests / "amfinder_external_tiles_index")
-    embed_store = _ensure_external_cache(ext_df, tiles_index_path, cfg=cfg)
+    embed_store = _ensure_external_cache(
+        ext_df,
+        tiles_index_path,
+        cfg=cfg,
+        force_rebuild=force_rebuild,
+        cache_basename=cache_bn,
+    )
 
     device = torch.device("cuda")
     ckpt_path = ckpt_dir / CHECKPOINT_NAME
@@ -147,7 +278,15 @@ def run_amfinder_external_eval(
     calibration = st.get("calibration")
     slice_ms = protocol.loss_type == "slice_ms_only"
 
-    log.info(f"[External] Inferencia {len(ext_df):,} tiles AMFinder holdout...")
+    log.info(
+        f"[External | {EXTERNAL_VALIDATION_LABEL}] Inferencia probe Gate sobre "
+        f"{len(ext_df):,} tiles holdout externo..."
+    )
+    print(
+        f"[Gate AM | {EXTERNAL_VALIDATION_LABEL}] Inferencia probe Gate: "
+        f"{len(ext_df):,} tiles (no entrena ViT Stage2)",
+        flush=True,
+    )
     pred = evaluate_gate_probe_on_df(
         model,
         ext_df,
@@ -181,7 +320,10 @@ def run_amfinder_external_eval(
     metrics_summary: dict[str, Any] = {
         "dataset": "amfinder_external_test",
         "checkpoint": str(ckpt_path),
-        "n_images": int(ext_df["image_path"].nunique()),
+        "n_images": n_images,
+        "n_images_total_available": n_images_total,
+        "max_images_config": int(max_images),
+        "cache_basename": cache_bn,
         "n_tiles": len(pred),
         "acc": float(g1["acc"]),
         "macro_f1": float(g1["macro_f1"]),
@@ -231,7 +373,11 @@ def run_amfinder_external_eval(
     report_lines = [
         "# Validacion externa AMFinder (holdout bloqueado)",
         "",
-        f"- Tiles: **{len(pred):,}** ({metrics_summary['n_images']} imagenes)",
+        f"- Imagenes: **{metrics_summary['n_images']}**"
+        f" (de {metrics_summary['n_images_total_available']} disponibles)"
+        if metrics_summary["n_images"] < metrics_summary["n_images_total_available"]
+        else f" ({metrics_summary['n_images']} imagenes)",
+        f"- Tiles: **{len(pred):,}**",
         f"- Accuracy: **{metrics_summary['acc']:.3f}**",
         f"- Macro F1: **{metrics_summary['macro_f1']:.3f}**",
         f"- Recall M+: **{metrics_summary['per_class_recall'].get('Mplus', 0):.3f}**",
@@ -254,7 +400,7 @@ def run_amfinder_external_eval(
     if not skip_maps:
         import torch
 
-        for rel in sorted(ext_df["image_path"].unique())[:10]:
+        for rel in sorted(ext_df["image_path"].unique())[: max(1, n_images)]:
             sub = ext_df[ext_df["image_path"] == rel]
             img_path = paths.root / "Data" / rel
             if not img_path.exists():
@@ -275,7 +421,15 @@ def run_amfinder_external_eval(
             )
 
     log.info(
-        f"[External] OK macro_f1={metrics_summary['macro_f1']:.3f} "
-        f"recall_M+={metrics_summary['per_class_recall'].get('Mplus', 0):.3f}"
+        f"[External | {EXTERNAL_VALIDATION_LABEL}] OK macro_f1={metrics_summary['macro_f1']:.3f} "
+        f"recall_M+={metrics_summary['per_class_recall'].get('Mplus', 0):.3f} "
+        f"-> {ext_root}"
+    )
+    print(
+        f"[Gate AM | {EXTERNAL_VALIDATION_LABEL}] COMPLETA — macro_f1="
+        f"{metrics_summary['macro_f1']:.3f} recall_M+="
+        f"{metrics_summary['per_class_recall'].get('Mplus', 0):.3f} "
+        f"(reporte: {ext_root / 'reports'})",
+        flush=True,
     )
     return metrics_summary
