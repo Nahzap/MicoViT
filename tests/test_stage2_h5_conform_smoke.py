@@ -16,14 +16,14 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
-def test_prior_fingerprint_is_v8() -> None:
+def test_prior_fingerprint_is_v16() -> None:
     from micorizae.phase_e_stage2.pixel_morph import PixelMorphParams
     from micorizae.phase_e_stage2.pixel_prior_maps import PRIOR_IMPL_VERSION
     from micorizae.phase_e_stage2.stage2_pixel_h5_cache import _prior_fingerprint
 
-    assert PRIOR_IMPL_VERSION == 8
+    assert PRIOR_IMPL_VERSION == 16
     fp = _prior_fingerprint(PixelMorphParams(), 224, "20260710_121127_gate_am_train")
-    assert fp.endswith("|prior_v8"), fp
+    assert fp.endswith("|prior_v16"), fp
 
 
 def test_pack_one_shapes_and_v_authority() -> None:

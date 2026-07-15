@@ -4,11 +4,12 @@
   1. Conformar database (manifest + tiles_index)
   2. Database → HDF5 Gate (luma + labels tile M+/M-/BG)
   3. Entrenar Gate (DINOv2 + probe): clasificador tile para cualquier imagen AM
-  4. HDF5 Stage2 (tiles M+ → rgb, weak IH/V/A/H, priors v3)
+  4. Preview pseudo-labels Stage2 (~25 tiles) + HDF5 Stage2 (tiles M+ → rgb/label/priors)
   5. Entrenar Stage2-Pixel ViT
   6. Resultados + full-image (divide en tiles, mapas píxel densos)
 
 Pasos 2–3 se ejecutan juntos en ``train-gate-am`` (orquestación interna Gate SSD).
+El preview del paso 4 se omite si ``STAGE2_PIXEL_LABEL_PREVIEW_BEFORE_H5=False``.
 """
 
 from __future__ import annotations
@@ -128,6 +129,22 @@ def main() -> None:
     if args.wipe_stage2_h5:
         for name in ("stage2_pixel_mplus_v1.h5", "stage2_pixel_mplus_v1.meta.json", "stage2_pixel_mplus_v1.lookup.parquet"):
             (ROOT / "cache" / name).unlink(missing_ok=True)
+
+    preview_n = int(getattr(user_config, "STAGE2_PIXEL_LABEL_PREVIEW_N", 25))
+    if bool(getattr(user_config, "STAGE2_PIXEL_LABEL_PREVIEW_BEFORE_H5", True)):
+        plan.append(
+            (
+                4,
+                f"preview pseudo-labels Stage2 ({preview_n} tiles) antes de H5",
+                [
+                    str(PY),
+                    str(ROOT / "run.py"),
+                    "preview-stage2-pixel-labels",
+                    "--n-tiles",
+                    str(preview_n),
+                ],
+            )
+        )
 
     plan.append(
         (4, "HDF5 Stage2 M+", [str(PY), str(ROOT / "run.py"), "build-stage2-pixel-cache", "--force-rebuild"])

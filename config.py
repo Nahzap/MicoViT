@@ -288,10 +288,13 @@ STAGE2_PIXEL_VESICLE_CIRCULARITY_MIN: float = 0.72
 STAGE2_PIXEL_FRANGI_PCTL: float = 82.0
 STAGE2_PIXEL_ARBUSCULE_PCTL: float = 93.0
 # Pseudo-GT v3: híbrido contorno cerrado + semilla LoG refinada (sin discos sintéticos)
-STAGE2_PIXEL_PSEUDO_GT_VERSION: str = "v3_hybrid_contour_log"
+STAGE2_PIXEL_PSEUDO_GT_VERSION: str = "v5_atlas_multitile_no_hough"
 STAGE2_PIXEL_VESICLE_MAX_RADIUS: int = 0  # 0 = adaptativo (min(tile/2, 80))
 STAGE2_PIXEL_VESICLE_MAX_SIGMA: float = 40.0  # ATLAS multi-escala (antes 16)
 STAGE2_PIXEL_AMBIGUOUS_TO_H_DENSE: bool = True  # saturación homogénea → H, no ignore
+# Preview visual (N tiles aleatorias) antes de build-stage2-pixel-cache
+STAGE2_PIXEL_LABEL_PREVIEW_N: int = 25
+STAGE2_PIXEL_LABEL_PREVIEW_BEFORE_H5: bool = True  # orquestadores: preview → H5
 STAGE2_PIXEL_H5_ENABLED: bool = True
 STAGE2_PIXEL_H5_COMPRESSION: str = "none"  # build: none = max velocidad; train usa RAM cache
 STAGE2_PIXEL_H5_FORCE_REBUILD: bool = False   # one-shot completado 2026-07-08

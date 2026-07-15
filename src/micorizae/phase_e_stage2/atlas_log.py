@@ -84,15 +84,24 @@ def _ellipse_aspect(contour: np.ndarray) -> float:
 
 
 def _contour_is_closed(contour: np.ndarray, *, tol_px: float = 2.5) -> bool:
-    """Contorno cerrado: primer y último vértice coinciden (OpenCV) o perímetro>0."""
+    """Contorno cerrado topológico (findContours / área positiva).
+
+    OpenCV no garantiza el primer vértice; CHAIN_APPROX_SIMPLE puede dejar
+    extremos lejanos aun en regiones cerradas. Criterio: perímetro+área y
+    (extremos cercanos O región rellenable coherente).
+    """
     if contour is None or len(contour) < 5:
         return False
     peri = float(cv2.arcLength(contour, True))
-    if peri < 1e-3:
+    area = abs(float(cv2.contourArea(contour)))
+    if peri < 1e-3 or area < 1.0:
         return False
     p0 = contour[0, 0].astype(np.float32)
     p1 = contour[-1, 0].astype(np.float32)
-    return float(np.linalg.norm(p0 - p1)) <= float(tol_px)
+    if float(np.linalg.norm(p0 - p1)) <= float(tol_px):
+        return True
+    # Contorno de findContours: cerrado al dibujar; extremos pueden no coincidir.
+    return area >= 4.0 and peri >= 8.0
 
 
 def _contour_annulus_contrast(
@@ -102,7 +111,11 @@ def _contour_annulus_contrast(
     ring_scale: float = 1.6,
     contrast_min: float = 0.08,
 ) -> bool:
-    """Interior del contorno más denso que anillo externo (vesícula ≠ hifa plana)."""
+    """Contraste anular: V densa (interior > exterior) o V de pared (anillo).
+
+    McGonigle: vesículas rellenas o pálidas con pared teñida. Rechaza placas
+    planas sin contraste radial (hifa/colonia aplastada).
+    """
     mask = np.zeros(density.shape, dtype=np.uint8)
     cv2.drawContours(mask, [contour], -1, 1, thickness=-1)
     area = int(mask.sum())
@@ -116,11 +129,21 @@ def _contour_annulus_contrast(
     yy, xx = np.ogrid[: density.shape[0], : density.shape[1]]
     dist2 = (yy - cy) ** 2 + (xx - cx) ** 2
     inner = dist2 <= r_in * r_in
-    ring = (dist2 > r * r) & (dist2 <= r_out * r_out)
-    if int(inner.sum()) < 2 or int(ring.sum()) < 2:
+    # Anillo exterior (fuera del disco) + anillo de pared (borde del contorno)
+    ring_out = (dist2 > r * r) & (dist2 <= r_out * r_out)
+    wall = (dist2 > (r * 0.72) ** 2) & (dist2 <= (r * 1.08) ** 2) & (mask > 0)
+    if int(inner.sum()) < 2:
         return False
-    contrast = float(density[inner].mean()) - float(density[ring].mean())
-    return contrast >= float(contrast_min)
+    d_in = float(density[inner].mean())
+    # (1) V densa: interior más teñido que exterior
+    if int(ring_out.sum()) >= 2:
+        if (d_in - float(density[ring_out].mean())) >= float(contrast_min):
+            return True
+    # (2) V pálida con pared: anillo/pared más denso que núcleo
+    if int(wall.sum()) >= 2:
+        if (float(density[wall].mean()) - d_in) >= float(contrast_min) * 0.85:
+            return True
+    return False
 
 
 def _root_bbox(mask: np.ndarray, *, pad: int = 0) -> Optional[tuple[int, int, int, int]]:
@@ -369,7 +392,9 @@ def _extract_contour_at_log_seed(
         if not _contour_is_closed(c):
             continue
         area = float(cv2.contourArea(c))
-        if area < float(min_area) or area > float(pad * pad * 0.55):
+        # Cap: ~disco de radio 1.45·r (morph close puede hinchar el blob)
+        area_cap = float(min(pad * pad * 0.85, np.pi * (float(r) * 1.45) ** 2))
+        if area < float(min_area) or area > area_cap:
             continue
         if cv2.pointPolygonTest(c, (float(cx), float(cy)), False) < 0:
             continue
@@ -544,7 +569,7 @@ def detect_vesicles_closed_contour(
     contrast_min: float = 0.06,
     density_pctl: float = 76.0,
     reject_tubular: bool = True,
-    max_area_frac: float = 0.15,
+    max_area_frac: float = 0.55,
     large_roundness_min: float = 0.80,
     min_contour_score: float = 4.5,
     max_instances: int = 20,
@@ -573,7 +598,10 @@ def detect_vesicles_closed_contour(
     elif frangi_map is not None:
         frangi_map = frangi_map.astype(np.float32)
     r_max = adaptive_ves_max_radius(dens.shape, 0)
-    area_cap = int(max_area) if max_area > 0 else int(root_b.sum() * float(max_area_frac))
+    # Vesículas grandes (~0.45·tile): π·r_max²; frac acota respecto al tejido.
+    area_from_r = int(np.pi * float(r_max) * float(r_max))
+    area_from_frac = int(root_b.sum() * float(max_area_frac))
+    area_cap = int(max_area) if max_area > 0 else int(min(area_from_r, area_from_frac))
     area_cap = max(area_cap, int(min_area))
 
     candidates: list[tuple[np.ndarray, float]] = _collect_log_seed_contours(
@@ -740,3 +768,135 @@ def continuous_log_response(
             detect_vesicles_closed_contour(density, root), root
         )
     return vesicle_prior_from_mask(vesicle_mask, root)
+
+
+def _tile_grid_components(
+    rows: list[int],
+    cols: list[int],
+) -> list[list[int]]:
+    """Componentes conexas en la grilla (Chebyshev ≤ 1 = vecinas 8-conectadas)."""
+    n = len(rows)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if max(abs(int(rows[i]) - int(rows[j])), abs(int(cols[i]) - int(cols[j]))) <= 1:
+                union(i, j)
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(i)
+    return list(comps.values())
+
+
+def detect_vesicle_masks_atlas_for_tiles(
+    densities: list[np.ndarray],
+    roots: list[np.ndarray],
+    rows: list[int],
+    cols: list[int],
+    tile_size: int,
+    *,
+    min_sigma: float = 2.0,
+    max_sigma: Optional[float] = None,
+    num_sigma: int = 14,
+    threshold: float = 0.038,
+    contrast_min: float = 0.06,
+    min_area: int = 30,
+    roundness_min: float = 0.72,
+    solidity_min: float = 0.82,
+    nms_dist_ratio: float = 0.55,
+    density_pctl: float = 76.0,
+    max_instances: int = 40,
+    max_mosaic_px: int = 6_000_000,
+) -> list[np.ndarray]:
+    """V multi-tile: ATLAS LoG sobre mosaicos locales (contornos reales).
+
+    No Hough. Agrupa tiles en componentes conexas de la grilla para no montar
+    un bbox enorme casi vacío entre tiles lejanos (Frangi/LoG se congelan).
+    """
+    n = len(densities)
+    assert n == len(roots) == len(rows) == len(cols)
+    if n == 0:
+        return []
+    ts = int(tile_size)
+    out = [np.zeros(densities[i].shape[:2], dtype=bool) for i in range(n)]
+
+    # σ grande para vesículas que cruzan bordes (~0.45·tile)
+    sigma_cap = float(max_sigma) if max_sigma is not None else max(40.0, 0.45 * float(ts))
+    sigma_cap = float(min(sigma_cap, 0.55 * float(ts)))
+
+    atlas_kw = dict(
+        min_sigma=float(min_sigma),
+        max_sigma=sigma_cap,
+        num_sigma=int(num_sigma),
+        threshold=float(threshold),
+        contrast_min=float(contrast_min),
+        min_area=int(min_area),
+        max_radius=int(0.55 * ts),
+        roundness_min=float(roundness_min),
+        solidity_min=float(solidity_min),
+        nms_dist_ratio=float(nms_dist_ratio),
+        reject_tubular=True,
+        density_pctl=float(density_pctl),
+        max_instances=int(max_instances),
+    )
+
+    def _atlas_one(i: int) -> np.ndarray:
+        return detect_vesicle_blobs_atlas(densities[i], roots[i], **atlas_kw)
+
+    for comp in _tile_grid_components(rows, cols):
+        if len(comp) == 1:
+            out[comp[0]] = _atlas_one(comp[0])
+            continue
+
+        r_comp = [int(rows[i]) for i in comp]
+        c_comp = [int(cols[i]) for i in comp]
+        rmin, rmax = min(r_comp), max(r_comp)
+        cmin, cmax = min(c_comp), max(c_comp)
+        n_r = rmax - rmin + 1
+        n_c = cmax - cmin + 1
+        mosaic_h = n_r * ts
+        mosaic_w = n_c * ts
+        fill_ratio = float(len(comp)) / float(max(n_r * n_c, 1))
+        # Bbox hueco o demasiado grande → ATLAS por tile (sin congelar Frangi)
+        if mosaic_h * mosaic_w > int(max_mosaic_px) or fill_ratio < 0.35:
+            for i in comp:
+                out[i] = _atlas_one(i)
+            continue
+
+        mosa_d = np.zeros((mosaic_h, mosaic_w), dtype=np.float32)
+        mosa_r = np.zeros((mosaic_h, mosaic_w), dtype=bool)
+        for i in comp:
+            dens = densities[i]
+            h, w = dens.shape[:2]
+            y0 = (int(rows[i]) - rmin) * ts
+            x0 = (int(cols[i]) - cmin) * ts
+            hh, ww = min(h, ts), min(w, ts)
+            mosa_d[y0 : y0 + hh, x0 : x0 + ww] = dens[:hh, :ww].astype(np.float32)
+            mosa_r[y0 : y0 + hh, x0 : x0 + ww] = roots[i].astype(bool)[:hh, :ww]
+
+        if not mosa_r.any():
+            continue
+
+        mosa_mask = detect_vesicle_blobs_atlas(mosa_d, mosa_r, **atlas_kw)
+        for i in comp:
+            h, w = densities[i].shape[:2]
+            y0 = (int(rows[i]) - rmin) * ts
+            x0 = (int(cols[i]) - cmin) * ts
+            hh, ww = min(h, ts), min(w, ts)
+            tile_m = np.zeros((h, w), dtype=bool)
+            tile_m[:hh, :ww] = mosa_mask[y0 : y0 + hh, x0 : x0 + ww]
+            out[i] = tile_m
+    return out

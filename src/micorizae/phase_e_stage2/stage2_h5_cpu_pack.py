@@ -72,3 +72,37 @@ def pack_one(tile_hwc_u8: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray],
 
 def pack_batch(tiles_hwc: list[np.ndarray]) -> list[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]]:
     return [pack_one(t) for t in tiles_hwc]
+
+
+def apply_v_overlays(
+    packs: list[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]],
+    v_masks_native: list[np.ndarray],
+    *,
+    input_size: Optional[int] = None,
+) -> list[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]]:
+    """Aplica máscaras V ATLAS (native) sobre packs ya etiquetados."""
+    from .detectors.v_vesicle import apply_v_masks_to_label_and_priors
+    from .pixel_class_map import PIXEL_CLASS_TO_IDX
+
+    if not v_masks_native:
+        return packs
+    size = int(input_size if input_size is not None else (_g_input_size or 224))
+    v_idx = PIXEL_CLASS_TO_IDX["V"]
+    out = []
+    for pack, vmask in zip(packs, v_masks_native):
+        lab, ev, ves = pack
+        lab2, ev2, ves2 = apply_v_masks_to_label_and_priors(
+            lab, ev, ves, vmask, input_size=size, v_idx=v_idx
+        )
+        out.append((lab2, ev2, ves2))
+    return out
+
+
+def apply_giant_overlays(
+    packs: list[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]],
+    giant_masks_native: list[np.ndarray],
+    *,
+    input_size: Optional[int] = None,
+) -> list[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]]:
+    """DEPRECATED alias → ``apply_v_overlays``."""
+    return apply_v_overlays(packs, giant_masks_native, input_size=input_size)

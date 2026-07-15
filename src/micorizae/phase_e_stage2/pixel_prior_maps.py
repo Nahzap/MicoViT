@@ -30,7 +30,7 @@ from .pixel_morph import PixelMorphParams, segment_tile_pixel_morph
 #   v6 = V solo contornos cerrados reales (sin discos sintéticos LoG).
 #   v7 = híbrido: contorno + semilla LoG refinada + residual local.
 #   v8 = SRP: arb_score cache + prior V ≡ detector; sin ruta grayscale.
-PRIOR_IMPL_VERSION = 8  # SRP: arb_score cache + prior V ≡ detector mask
+PRIOR_IMPL_VERSION = 16  # V = ATLAS multi-tile contorno (sin Hough)
 
 def _imagenet_mean_std():
     import torch

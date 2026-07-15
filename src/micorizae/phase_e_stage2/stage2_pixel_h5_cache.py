@@ -487,7 +487,7 @@ def build_stage2_pixel_h5_cache(
         with pool_ctx if use_process_pool else ThreadPoolExecutor(max_workers=1) as cpu_pool, ThreadPoolExecutor(
             max_workers=max(6, inflight + 2)
         ) as overlap_pool:
-            pending: deque[tuple[np.ndarray, Future]] = deque()
+            pending: deque[tuple[np.ndarray, Future, Optional[list]]] = deque()
             last_log_t = t0
             current_img = ""
 
@@ -495,8 +495,14 @@ def build_stage2_pixel_h5_cache(
                 nonlocal write_idx, last_log_t
                 if not pending:
                     return
-                rgb_w, fut_w = pending.popleft()
+                rgb_w, fut_w, v_masks_w = pending.popleft()
                 packs = fut_w.result()
+                if v_masks_w is not None:
+                    from . import stage2_h5_cpu_pack as _cpu_pack
+
+                    packs = _cpu_pack.apply_v_overlays(
+                        packs, v_masks_w, input_size=input_size
+                    )
                 write_idx = _write_h5_batch(
                     hf,
                     write_idx=write_idx,
@@ -532,6 +538,11 @@ def build_stage2_pixel_h5_cache(
                 coords = list(zip(sub["row"].astype(int), sub["col"].astype(int)))
                 ts = int(sub["tile_size"].iloc[0]) if "tile_size" in sub.columns else 252
 
+                # 1) Extrae todos los tiles de la imagen (contexto multi-tile V gigante)
+                tiles_hwc_all: list[np.ndarray] = []
+                rgb_chunks: list[np.ndarray] = []
+                rows_all: list[int] = []
+                cols_all: list[int] = []
                 chunk_coords = [
                     coords[i : i + batch_size] for i in range(0, len(coords), batch_size)
                 ]
@@ -541,19 +552,45 @@ def build_stage2_pixel_h5_cache(
                     rgb_t = rgb_view_gpu(tiles, target_size=input_size, normalize_imagenet=True)
                     rgb_np = rgb_t.cpu().numpy().astype(np.float16)
                     tiles_np = tiles.permute(0, 2, 3, 1).contiguous().cpu().numpy()
-                    tiles_hwc = [tiles_np[j] for j in range(tiles_np.shape[0])]
-
-                    if use_process_pool:
-                        fut = overlap_pool.submit(_run_cpu_pack_process, cpu_pool, tiles_hwc)
-                    else:
-                        fut = overlap_pool.submit(cpu_pack.pack_batch, tiles_hwc)
-                    pending.append((rgb_np, fut))
-
-                    while len(pending) >= inflight:
-                        _flush_pending()
+                    for j in range(tiles_np.shape[0]):
+                        tiles_hwc_all.append(tiles_np[j])
+                        rows_all.append(int(chunk[j][0]))
+                        cols_all.append(int(chunk[j][1]))
+                    rgb_chunks.append(rgb_np)
 
                 del gimg
                 torch.cuda.empty_cache()
+
+                # 2) V multi-tile ATLAS (contornos reales — sin Hough/disco)
+                from .detectors.v_vesicle import detect_vesicle_masks_for_tiles
+
+                v_masks = detect_vesicle_masks_for_tiles(
+                    tiles_hwc_all,
+                    rows_all,
+                    cols_all,
+                    ts,
+                )
+                n_v_px = int(sum(int(m.sum()) for m in v_masks))
+                print(
+                    f"[Stage2-Pixel H5] V-ATLAS multi-tile: {n_v_px:,} px en {Path(img_rel).name}",
+                    flush=True,
+                )
+
+                # 3) Pack CPU por batch + overlay V ATLAS
+                offset = 0
+                for rgb_np in rgb_chunks:
+                    b = int(rgb_np.shape[0])
+                    chunk_tiles = tiles_hwc_all[offset : offset + b]
+                    chunk_v = v_masks[offset : offset + b]
+                    offset += b
+                    if use_process_pool:
+                        fut = overlap_pool.submit(_run_cpu_pack_process, cpu_pool, chunk_tiles)
+                    else:
+                        fut = overlap_pool.submit(cpu_pack.pack_batch, chunk_tiles)
+                    pending.append((rgb_np, fut, chunk_v))
+
+                    while len(pending) >= inflight:
+                        _flush_pending()
 
             while pending:
                 _flush_pending()

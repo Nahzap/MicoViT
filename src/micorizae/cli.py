@@ -8,6 +8,7 @@ Acceso soportado:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -1412,6 +1413,55 @@ def train_stage2_cmd(
         json.dump(meta, f, indent=2)
     (run.root / "STAGE2_RUN_META.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     log.info(f"[Fase E] [bold green]OK[/bold green] -> {report_path}")
+
+
+@app.command(name="preview-stage2-pixel-labels")
+def preview_stage2_pixel_labels_cmd(
+    n_tiles: int = typer.Option(
+        None,
+        "--n-tiles",
+        help="Tiles aleatorias a renderizar (default config STAGE2_PIXEL_LABEL_PREVIEW_N=25).",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Semilla del muestreo aleatorio."),
+    out_dir: Optional[Path] = typer.Option(
+        None,
+        "--out-dir",
+        help="Directorio de salida (default outputs/stage2_label_preview_<ts>/).",
+    ),
+):
+    """Paso 0 Stage2: preview visual de pseudo-labels (~25 tiles) antes del H5 completo.
+
+    Misma ruta morph + V ATLAS multi-tile que ``build-stage2-pixel-cache``. Genera paneles
+    RGB | label | overlay bajo ``outputs/stage2_label_preview_*/panels/``.
+    Decode CPU (no GPU) para no interferir con un rebuild H5 en curso.
+    """
+    from .phase_e_stage2.stage2_pixel_label_preview import run_stage2_pixel_label_preview
+
+    n = int(n_tiles if n_tiles is not None else _cfg("STAGE2_PIXEL_LABEL_PREVIEW_N", 25))
+    gate_run_id = str(_cfg("STAGE2_PIXEL_GATE_RUN_ID", _cfg("STAGE2_GATE_RUN_ID", "")))
+    input_size = int(_cfg("STAGE2_PIXEL_INPUT_SIZE", 224))
+    val_fraction = float(_cfg("STAGE2_PIXEL_VAL_FRACTION", 0.2))
+    log.info(f"[Stage2-Pixel] label-preview: n_tiles={n} seed={seed} gate={gate_run_id}")
+    meta = run_stage2_pixel_label_preview(
+        n_tiles=n,
+        seed=int(seed),
+        out_dir=out_dir,
+        val_fraction=val_fraction,
+        gate_run_id=gate_run_id,
+        input_size=input_size,
+    )
+    print(
+        json.dumps(
+            {
+                "out_dir": meta.get("out_dir"),
+                "n_rendered": meta.get("n_rendered"),
+                "pseudo_gt_version": meta.get("pseudo_gt_version"),
+                "atlas_v_px_total": meta.get("atlas_v_px_total", meta.get("giant_v_px_total")),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
 
 @app.command(name="build-stage2-pixel-cache")
